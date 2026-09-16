@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 BASE=Path(__file__).resolve().parent
 DB=Path(os.getenv('FENIX_DB', str(BASE/'reino_fenix.db')))
 LOCK=threading.RLock(); ENGINE=threading.RLock()
-app=FastAPI(title='Reino Fénix', version='2.0-world')
+app=FastAPI(title='Reino Fénix', version='2.1-world-expansion')
 KINGDOMS=[(1,'Aurelia','Reina Elira I'),(2,'Valdoria','Rey Darian II')]
 CITIES=[(1,1,'Puerto Alba','Puerto y comercio'),(2,1,'Río Claro','Valle agrícola'),(3,1,'Bosque Alto','Bosque y minería'),(4,2,'Corona','Capital administrativa'),(5,2,'Monteluz','Ganadería y metalurgia'),(6,2,'Bahía Gris','Puerto y astilleros')]
 RES=['grano','madera','hierro','carbón','piedra','lana','ganado','pescado','sal','vino','herramientas']
@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS weather(id INTEGER PRIMARY KEY,city_id INTEGER,year I
 CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY,city_id INTEGER,name TEXT,cost INTEGER,progress REAL,required_days INTEGER,status TEXT DEFAULT 'planned');
 CREATE TABLE IF NOT EXISTS laws(id INTEGER PRIMARY KEY,kingdom_id INTEGER,name TEXT,effect TEXT,active INTEGER DEFAULT 1);
 CREATE INDEX IF NOT EXISTS ix_people_city ON people(city_id,alive); CREATE INDEX IF NOT EXISTS ix_events_date ON events(year,day,hour); CREATE INDEX IF NOT EXISTS ix_mem_person ON memories(person_id);
+CREATE TABLE IF NOT EXISTS regions(id INTEGER PRIMARY KEY,kingdom_id INTEGER,name TEXT UNIQUE,terrain TEXT,climate TEXT,description TEXT,development REAL DEFAULT 50);
+CREATE TABLE IF NOT EXISTS settlements(id INTEGER PRIMARY KEY,region_id INTEGER,name TEXT UNIQUE,kind TEXT,population INTEGER DEFAULT 0,fortification REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS noble_houses(id INTEGER PRIMARY KEY,kingdom_id INTEGER,name TEXT UNIQUE,title TEXT,seat_settlement_id INTEGER,wealth INTEGER,prestige REAL,influence REAL,alignment TEXT,goal TEXT,heir_id INTEGER,active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS estates(id INTEGER PRIMARY KEY,house_id INTEGER,region_id INTEGER,name TEXT,type TEXT,size REAL,productivity REAL,workers INTEGER,value INTEGER);
+CREATE TABLE IF NOT EXISTS house_members(house_id INTEGER,person_id INTEGER,role TEXT,succession_rank INTEGER,PRIMARY KEY(house_id,person_id));
+CREATE TABLE IF NOT EXISTS roads(id INTEGER PRIMARY KEY,origin_settlement_id INTEGER,dest_settlement_id INTEGER,distance INTEGER,condition REAL,security REAL,capacity INTEGER,blocked INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS titles(id INTEGER PRIMARY KEY,person_id INTEGER,house_id INTEGER,title TEXT,start_year INTEGER,start_day INTEGER,end_year INTEGER,end_day INTEGER,active INTEGER DEFAULT 1);
+CREATE INDEX IF NOT EXISTS ix_regions_kingdom ON regions(kingdom_id); CREATE INDEX IF NOT EXISTS ix_houses_kingdom ON noble_houses(kingdom_id); CREATE INDEX IF NOT EXISTS ix_estates_house ON estates(house_id);
+
 '''
 
 def con():
@@ -100,6 +109,43 @@ def seed(c):
   for i,n in enumerate(factions):q(c,'INSERT INTO factions(kingdom_id,name,influence,goal) VALUES(?,?,?,?)',(kid,n,rng.randint(20,50),goals[i]))
   for n in ['Consejero','Tesorero','Mariscal','Juez']: holder=q(c,'SELECT id FROM people WHERE kingdom_id=? AND age>=30 ORDER BY RANDOM() LIMIT 1',(kid,)).fetchone()['id']; q(c,'INSERT INTO offices(kingdom_id,name,holder_id) VALUES(?,?,?)',(kid,n,holder))
   city=1 if kid==1 else 4; cmd=q(c,'SELECT id FROM people WHERE city_id=? AND age>=30 ORDER BY RANDOM() LIMIT 1',(city,)).fetchone()['id']; q(c,'INSERT INTO armies(kingdom_id,city_id,name,soldiers,morale,supplies,commander_id) VALUES(?,?,?,?,?,?,?)',(kid,city,'Guardia Real',700,80,90,cmd)); q(c,'INSERT INTO armies(kingdom_id,city_id,name,soldiers,morale,supplies,commander_id) VALUES(?,?,?,?,?,?,?)',(kid,city,'Ejército de Campaña',1800,75,85,cmd))
+
+ # Deep geographic and noble foundation. Idempotent on existing worlds.
+ region_defs=[
+  (1,1,'Costa del Alba','costa','templado marítimo','Litoral de Aurelia; pesca, sal, comercio y astilleros.',58),
+  (2,1,'Valle del Claro','valle fluvial','templado húmedo','Valle agrícola atravesado por el río Claro.',62),
+  (3,1,'Bosques de Altara','bosque y colinas','templado','Bosques y tierras altas con madera, hierro, piedra y carbón.',51),
+  (4,2,'Corona Central','llanura y colinas','templado continental','Núcleo político y administrativo de Valdoria.',70),
+  (5,2,'Tierras de Monteluz','montaña y pastizal','templado seco','Pastizales y montañas dedicados a ganadería y metalurgia.',56),
+  (6,2,'Costa Gris','costa rocosa','marítimo fresco','Costa estratégica de comercio, pesca y construcción naval.',60),
+ ]
+ for r in region_defs:q(c,'INSERT OR IGNORE INTO regions VALUES(?,?,?,?,?,?,?)',r)
+ settlement_defs=[(1,1,'Puerto Alba','ciudad',0,45),(2,2,'Río Claro','ciudad',0,15),(3,3,'Bosque Alto','ciudad',0,20),(4,4,'Corona','capital',0,70),(5,5,'Monteluz','ciudad',0,35),(6,6,'Bahía Gris','ciudad',0,45)]
+ for x in settlement_defs:q(c,'INSERT OR IGNORE INTO settlements VALUES(?,?,?,?,?,?)',x)
+ for cid,region_id in [(1,1),(2,2),(3,3),(4,4),(5,5),(6,6)]:q(c,'UPDATE settlements SET population=(SELECT COUNT(*) FROM people WHERE city_id=? AND alive=1) WHERE id=?',(cid,cid))
+ house_names={1:['Casa Avelar','Casa Brisen','Casa Corven','Casa Dalmont','Casa Elar','Casa Feron','Casa Garen','Casa Halvek','Casa Iver','Casa Jastor','Casa Keryn','Casa Lorian','Casa Merrow','Casa Norven','Casa Ordan','Casa Perrin','Casa Quill','Casa Rhen','Casa Sorell','Casa Tervan'],2:['Casa Arven','Casa Brelor','Casa Caster','Casa Draven','Casa Ermont','Casa Falcor','Casa Grisel','Casa Harrow','Casa Ilven','Casa Jorren','Casa Kaldor','Casa Lestyn','Casa Marden','Casa Norell','Casa Orven','Casa Pryce','Casa Queron','Casa Rask','Casa Selwyn','Casa Torren']}
+ align=['Corona','Reformistas','Tradicionalistas','Mercantilistas','Militaristas']; goals=['preservar sus tierras','ampliar influencia política','proteger su linaje','dominar una ruta comercial','aumentar su riqueza']
+ hid=1
+ for kid in (1,2):
+  cityids=[x[0] for x in CITIES if x[1]==kid]
+  for idx,name in enumerate(house_names[kid]):
+   existing=q(c,'SELECT id FROM noble_houses WHERE name=?',(name,)).fetchone()
+   if existing: hid=existing['id']+1; continue
+   seat=cityids[idx%3]; wealth=5000+rng.randint(0,15000); prestige=35+rng.randint(0,55); influence=20+rng.randint(0,70); alignment=align[idx%len(align)]; goal=goals[idx%len(goals)]
+   q(c,'INSERT INTO noble_houses(id,kingdom_id,name,title,seat_settlement_id,wealth,prestige,influence,alignment,goal) VALUES(?,?,?,?,?,?,?,?,?,?)',(hid,kid,name,'Señor',seat,wealth,prestige,influence,alignment,goal))
+   candidates=q(c,'SELECT id FROM people WHERE kingdom_id=? AND age>=25 ORDER BY RANDOM() LIMIT 4',(kid,)).fetchall()
+   for rank,person in enumerate(candidates,1):
+    q(c,'INSERT OR IGNORE INTO house_members VALUES(?,?,?,?)',(hid,person['id'],'señor' if rank==1 else ('heredero' if rank==2 else 'miembro'),rank))
+    q(c,'INSERT OR IGNORE INTO titles(person_id,house_id,title,start_year,start_day) VALUES(?,?,?,?,?)',(person['id'],hid,'Señor de '+name.replace('Casa ',''),1,1))
+   heir=candidates[1]['id'] if len(candidates)>1 else (candidates[0]['id'] if candidates else None)
+   q(c,'UPDATE noble_houses SET heir_id=? WHERE id=?',(heir,hid))
+   reg=idx%3+1 if kid==1 else 4+(idx%3); estate_name='Dominio de '+name.replace('Casa ',''); etype=['granja','bosque','mina','viñedo','ganadería'][idx%5]
+   q(c,'INSERT INTO estates(house_id,region_id,name,type,size,productivity,workers,value) VALUES(?,?,?,?,?,?,?,?)',(hid,reg,estate_name,etype,rng.uniform(20,400),rng.uniform(.45,.95),rng.randint(10,80),rng.randint(8000,50000)))
+   hid+=1
+ # Physical roads between principal settlements, separate from abstract trade routes.
+ road_defs=[(1,2,52,82,78,20),(2,3,68,67,72,15),(3,4,132,61,68,12),(4,5,82,76,75,20),(5,6,91,73,80,18),(6,1,161,69,76,15),(2,5,145,64,70,10)]
+ for i,(a,b,dist,cond,sec,cap) in enumerate(road_defs,1):q(c,'INSERT OR IGNORE INTO roads VALUES(?,?,?,?,?,?,?,?)',(i,a,b,dist,cond,sec,cap,0))
+
  for p in q(c,'SELECT id FROM people').fetchall(): q(c,'INSERT INTO knowledge VALUES(?,?,?,?,?,?,?)',(p['id'],'El reino existe y la vida cotidiana continúa.',1,None,1,1,1.0))
  ev(c,1,1,6,'fundación',100,'Comienza la era de Fénix','Aurelia y Valdoria entran en el primer día registrado de esta historia.','estado inicial','el mundo queda listo para evolucionar')
 
@@ -198,10 +244,32 @@ def api_world():
 @app.get('/api/stats')
 def stats():
  with db() as c:
-  return {'population':q(c,'SELECT COUNT(*) n FROM people WHERE alive=1').fetchone()['n'],'dead':q(c,'SELECT COUNT(*) n FROM people WHERE alive=0').fetchone()['n'],'families':q(c,'SELECT COUNT(*) n FROM families').fetchone()['n'],'businesses':q(c,'SELECT COUNT(*) n FROM businesses WHERE active=1').fetchone()['n'],'conflicts':q(c,"SELECT COUNT(*) n FROM conflicts WHERE status='active'").fetchone()['n'],'events':q(c,'SELECT COUNT(*) n FROM events').fetchone()['n'],'chronicles':q(c,'SELECT COUNT(*) n FROM chronicles').fetchone()['n']}
+  return {'population':q(c,'SELECT COUNT(*) n FROM people WHERE alive=1').fetchone()['n'],'dead':q(c,'SELECT COUNT(*) n FROM people WHERE alive=0').fetchone()['n'],'families':q(c,'SELECT COUNT(*) n FROM families').fetchone()['n'],'businesses':q(c,'SELECT COUNT(*) n FROM businesses WHERE active=1').fetchone()['n'],'conflicts':q(c,"SELECT COUNT(*) n FROM conflicts WHERE status='active'").fetchone()['n'],'events':q(c,'SELECT COUNT(*) n FROM events').fetchone()['n'],'chronicles':q(c,'SELECT COUNT(*) n FROM chronicles').fetchone()['n'],'regions':q(c,'SELECT COUNT(*) n FROM regions').fetchone()['n'],'noble_houses':q(c,'SELECT COUNT(*) n FROM noble_houses WHERE active=1').fetchone()['n'],'estates':q(c,'SELECT COUNT(*) n FROM estates').fetchone()['n'],'roads':q(c,'SELECT COUNT(*) n FROM roads').fetchone()['n']}
 @app.get('/api/people')
 def people(limit:int=50):
  with db() as c:return [dict(x) for x in q(c,'SELECT * FROM people ORDER BY id LIMIT ?',(max(1,min(limit,500)),)).fetchall()]
+
+@app.get('/api/regions')
+def regions():
+ with db() as c:
+  return [dict(x) for x in q(c,'SELECT r.*,k.name kingdom FROM regions r JOIN kingdoms k ON k.id=r.kingdom_id ORDER BY r.kingdom_id,r.id').fetchall()]
+@app.get('/api/settlements')
+def settlements():
+ with db() as c:
+  return [dict(x) for x in q(c,'SELECT s.*,r.name region,k.name kingdom FROM settlements s JOIN regions r ON r.id=s.region_id JOIN kingdoms k ON k.id=r.kingdom_id ORDER BY s.id').fetchall()]
+@app.get('/api/nobles')
+def nobles(limit:int=100):
+ with db() as c:
+  rows=q(c,'SELECT h.*,k.name kingdom FROM noble_houses h JOIN kingdoms k ON k.id=h.kingdom_id WHERE h.active=1 ORDER BY h.kingdom_id,h.id LIMIT ?',(max(1,min(limit,100)),)).fetchall()
+  out=[]
+  for h in rows:
+   x=dict(h); x['members']=[dict(m) for m in q(c,'SELECT p.id,p.name,p.age,p.sex,p.role,hm.role house_role,hm.succession_rank FROM house_members hm JOIN people p ON p.id=hm.person_id WHERE hm.house_id=? ORDER BY hm.succession_rank',(h['id'],)).fetchall()]; x['estates']=[dict(e) for e in q(c,'SELECT * FROM estates WHERE house_id=?',(h['id'],)).fetchall()]; out.append(x)
+  return out
+@app.get('/api/roads')
+def roads():
+ with db() as c:
+  return [dict(x) for x in q(c,'SELECT ro.*,a.name origin,b.name destination FROM roads ro JOIN settlements a ON a.id=ro.origin_settlement_id JOIN settlements b ON b.id=ro.dest_settlement_id ORDER BY ro.id').fetchall()]
+
 @app.get('/api/cities')
 def cities():
  with db() as c:return [dict(x) for x in q(c,'SELECT * FROM cities ORDER BY id').fetchall()]

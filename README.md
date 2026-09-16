@@ -1,11 +1,13 @@
-# Reino Fénix — mundo vivo
+# Reino Fénix — Master Expansion
 
-Prototipo ejecutable de una simulación persistente autónoma. Incluye población, familias y generaciones, relaciones, conocimiento, memoria, economía, empresas, mercados, rutas, envíos, política/facciones/oficios, ejércitos, conflictos, delitos como estructura de datos, clima, proyectos, leyes, eventos, crónicas y Modo Dios.
+Persistent autonomous world simulation. This package preserves the running v2.1 engine and adds the master design documents for the complete world architecture.
 
-## Ejecutar
-`pip install -r requirements.txt`
-`uvicorn server:app --reload`
-Abrir `http://127.0.0.1:8000`
+## Run
+```bash
+pip install -r requirements.txt
+uvicorn server:app --host 0.0.0.0 --port $PORT
+```
 
-## Nota de persistencia
-El prototipo usa SQLite local. Para producción prolongada debe migrarse a PostgreSQL y un worker persistente; Render necesita almacenamiento/base de datos persistente. Esta versión está pensada para validar el comportamiento del mundo antes de esa migración.
+Render/Python: `.python-version` pins Python 3.13.5 for compatible dependencies.
+
+See `MASTER_WORLD.md` for the complete world design and `IMPLEMENTATION_STATUS.md` for an honest implementation boundary.

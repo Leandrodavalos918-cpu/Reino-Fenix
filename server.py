@@ -1,473 +1,266 @@
 from __future__ import annotations
-
-import json
-import os
-import random
-import sqlite3
-import threading
-import time
+import json, os, random, sqlite3, threading, time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-BASE = Path(__file__).resolve().parent
-DB_PATH = Path(os.getenv("FENIX_DB", str(BASE / "reino_fenix.db")))
-
-app = FastAPI(title="Reino Fénix", version="1.0.0")
-
-# Todas las escrituras del motor pasan por este lock. SQLite sigue siendo local,
-# pero no permitimos escritores concurrentes dentro del proceso.
-DB_LOCK = threading.RLock()
-ENGINE_LOCK = threading.RLock()
-
-KINGDOMS = [(1, "Aurelia", "Reina Elira I"), (2, "Valdoria", "Rey Darian II")]
-CITIES = [
-    (1, 1, "Puerto Alba", "Costa occidental y puerto comercial"),
-    (2, 1, "Río Claro", "Valle agrícola junto al gran río"),
-    (3, 1, "Bosque Alto", "Zona boscosa y minera"),
-    (4, 2, "Corona", "Capital y centro administrativo"),
-    (5, 2, "Monteluz", "Meseta ganadera y metalúrgica"),
-    (6, 2, "Bahía Gris", "Puerto oriental y astilleros"),
-]
-RESOURCES = ["grano", "madera", "hierro", "carbón", "piedra", "lana", "ganado", "pescado", "sal", "vino", "herramientas"]
-FACTION_NAMES = ["Corona", "Reformistas", "Tradicionalistas"]
-FIRST = ["Aldo","Mara","Nolan","Iria","Tomas","Elian","Vera","Soren","Lia","Bran","Nadia","Oren","Celia","Darin","Mael","Rina","Galen","Talia","Ronan","Ema"]
-LAST = ["Ravel","Veyne","Orlan","Marek","Dorne","Valen","Rios","Alvar","Seren","Kerr","Mont","Arden","Falk","Neris","Vale"]
-ROLES = ["agricultor","artesano","mercader","guardia","marinero","minero","constructor","curandero","escriba","pastor","pescador","herrero"]
-TRAITS = ["prudente","ambicioso","leal","curioso","desconfiado","sociable","reservado","arriesgado","paciente","impulsivo"]
-
-SCHEMA = r'''
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-CREATE TABLE IF NOT EXISTS world_state (
- id INTEGER PRIMARY KEY CHECK(id=1), year INTEGER NOT NULL, day INTEGER NOT NULL,
- last_real REAL NOT NULL, speed REAL NOT NULL DEFAULT 24.0, paused INTEGER NOT NULL DEFAULT 0,
- treasury INTEGER NOT NULL DEFAULT 100000, inflation REAL NOT NULL DEFAULT 0.0,
- created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS kingdoms (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, ruler TEXT NOT NULL, treasury INTEGER NOT NULL DEFAULT 50000);
-CREATE TABLE IF NOT EXISTS cities (id INTEGER PRIMARY KEY, kingdom_id INTEGER NOT NULL, name TEXT UNIQUE NOT NULL, description TEXT, population INTEGER NOT NULL DEFAULT 0, prosperity REAL NOT NULL DEFAULT 50, FOREIGN KEY(kingdom_id) REFERENCES kingdoms(id));
-CREATE TABLE IF NOT EXISTS districts (id INTEGER PRIMARY KEY, city_id INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE(city_id,name), FOREIGN KEY(city_id) REFERENCES cities(id));
-CREATE TABLE IF NOT EXISTS properties (id INTEGER PRIMARY KEY, city_id INTEGER NOT NULL, district_id INTEGER, owner_id INTEGER, kind TEXT NOT NULL, value INTEGER NOT NULL, occupied INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(city_id) REFERENCES cities(id));
-CREATE TABLE IF NOT EXISTS people (
- id INTEGER PRIMARY KEY, kingdom_id INTEGER NOT NULL, city_id INTEGER NOT NULL, name TEXT NOT NULL, age INTEGER NOT NULL,
- sex TEXT NOT NULL, alive INTEGER NOT NULL DEFAULT 1, health REAL NOT NULL DEFAULT 80, wealth INTEGER NOT NULL DEFAULT 100,
- role TEXT NOT NULL, trait TEXT NOT NULL, ambition REAL NOT NULL DEFAULT 50, loyalty REAL NOT NULL DEFAULT 50,
- married_to INTEGER, father_id INTEGER, mother_id INTEGER, household_id INTEGER, status TEXT NOT NULL DEFAULT 'citizen',
- FOREIGN KEY(kingdom_id) REFERENCES kingdoms(id), FOREIGN KEY(city_id) REFERENCES cities(id));
-CREATE TABLE IF NOT EXISTS families (id INTEGER PRIMARY KEY, surname TEXT NOT NULL, city_id INTEGER NOT NULL, wealth INTEGER NOT NULL DEFAULT 200, FOREIGN KEY(city_id) REFERENCES cities(id));
-CREATE TABLE IF NOT EXISTS relationships (person_a INTEGER NOT NULL, person_b INTEGER NOT NULL, kind TEXT NOT NULL, strength INTEGER NOT NULL, PRIMARY KEY(person_a,person_b), FOREIGN KEY(person_a) REFERENCES people(id), FOREIGN KEY(person_b) REFERENCES people(id));
-CREATE TABLE IF NOT EXISTS knowledge (person_id INTEGER NOT NULL, fact TEXT NOT NULL, truth INTEGER NOT NULL DEFAULT 1, source_person_id INTEGER, known_day INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(person_id,fact), FOREIGN KEY(person_id) REFERENCES people(id));
-CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, person_id INTEGER NOT NULL, event_id INTEGER, memory TEXT NOT NULL, importance INTEGER NOT NULL DEFAULT 50, created_day INTEGER NOT NULL, FOREIGN KEY(person_id) REFERENCES people(id));
-CREATE TABLE IF NOT EXISTS nobles (id INTEGER PRIMARY KEY, person_id INTEGER NOT NULL UNIQUE, title TEXT NOT NULL, house TEXT NOT NULL, power INTEGER NOT NULL, FOREIGN KEY(person_id) REFERENCES people(id));
-CREATE TABLE IF NOT EXISTS factions (id INTEGER PRIMARY KEY, kingdom_id INTEGER NOT NULL, name TEXT NOT NULL, influence INTEGER NOT NULL DEFAULT 33, UNIQUE(kingdom_id,name));
-CREATE TABLE IF NOT EXISTS offices (id INTEGER PRIMARY KEY, kingdom_id INTEGER NOT NULL, name TEXT NOT NULL, holder_id INTEGER, FOREIGN KEY(kingdom_id) REFERENCES kingdoms(id), FOREIGN KEY(holder_id) REFERENCES people(id));
-CREATE TABLE IF NOT EXISTS resources (id INTEGER PRIMARY KEY, city_id INTEGER NOT NULL, resource TEXT NOT NULL, quantity INTEGER NOT NULL, price REAL NOT NULL, demand REAL NOT NULL DEFAULT 1.0, UNIQUE(city_id,resource));
-CREATE TABLE IF NOT EXISTS businesses (id INTEGER PRIMARY KEY, city_id INTEGER NOT NULL, owner_id INTEGER, name TEXT NOT NULL, kind TEXT NOT NULL, workers INTEGER NOT NULL, cash INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(city_id) REFERENCES cities(id), FOREIGN KEY(owner_id) REFERENCES people(id));
-CREATE TABLE IF NOT EXISTS routes (id INTEGER PRIMARY KEY, origin_city INTEGER NOT NULL, dest_city INTEGER NOT NULL, distance INTEGER NOT NULL, security INTEGER NOT NULL DEFAULT 70, condition INTEGER NOT NULL DEFAULT 80, FOREIGN KEY(origin_city) REFERENCES cities(id), FOREIGN KEY(dest_city) REFERENCES cities(id));
-CREATE TABLE IF NOT EXISTS shipments (id INTEGER PRIMARY KEY, route_id INTEGER NOT NULL, resource TEXT NOT NULL, quantity INTEGER NOT NULL, days_left INTEGER NOT NULL, owner_id INTEGER, status TEXT NOT NULL DEFAULT 'moving', FOREIGN KEY(route_id) REFERENCES routes(id));
-CREATE TABLE IF NOT EXISTS conflicts (id INTEGER PRIMARY KEY, name TEXT NOT NULL, side_a TEXT NOT NULL, side_b TEXT NOT NULL, intensity INTEGER NOT NULL, cause TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', started_day INTEGER NOT NULL, casualties INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, year INTEGER NOT NULL, day INTEGER NOT NULL, category TEXT NOT NULL, importance INTEGER NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, cause TEXT, consequence TEXT);
-CREATE TABLE IF NOT EXISTS chronicles (id INTEGER PRIMARY KEY, year INTEGER NOT NULL, day INTEGER NOT NULL UNIQUE, text TEXT NOT NULL, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS divine_interventions (id INTEGER PRIMARY KEY, year INTEGER NOT NULL, day INTEGER NOT NULL, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id INTEGER NOT NULL, parameters TEXT NOT NULL, description TEXT NOT NULL, consequence TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS divine_schedules (id INTEGER PRIMARY KEY, execute_year INTEGER NOT NULL, execute_day INTEGER NOT NULL, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id INTEGER NOT NULL, parameters TEXT NOT NULL, description TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS divine_letters (id INTEGER PRIMARY KEY, year INTEGER NOT NULL, day INTEGER NOT NULL, recipient_id INTEGER NOT NULL, sender_text TEXT NOT NULL, body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(recipient_id) REFERENCES people(id));
-CREATE TABLE IF NOT EXISTS divine_weather (id INTEGER PRIMARY KEY, year INTEGER NOT NULL, day INTEGER NOT NULL, city_id INTEGER, weather TEXT NOT NULL, intensity INTEGER NOT NULL, end_day INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1);
-CREATE INDEX IF NOT EXISTS idx_people_city ON people(city_id,alive);
-CREATE INDEX IF NOT EXISTS idx_events_day ON events(year,day);
-CREATE INDEX IF NOT EXISTS idx_memory_person ON memories(person_id);
+BASE=Path(__file__).resolve().parent
+DB=Path(os.getenv('FENIX_DB', str(BASE/'reino_fenix.db')))
+LOCK=threading.RLock(); ENGINE=threading.RLock()
+app=FastAPI(title='Reino Fénix', version='2.0-world')
+KINGDOMS=[(1,'Aurelia','Reina Elira I'),(2,'Valdoria','Rey Darian II')]
+CITIES=[(1,1,'Puerto Alba','Puerto y comercio'),(2,1,'Río Claro','Valle agrícola'),(3,1,'Bosque Alto','Bosque y minería'),(4,2,'Corona','Capital administrativa'),(5,2,'Monteluz','Ganadería y metalurgia'),(6,2,'Bahía Gris','Puerto y astilleros')]
+RES=['grano','madera','hierro','carbón','piedra','lana','ganado','pescado','sal','vino','herramientas']
+ROLES=['agricultor','artesano','mercader','guardia','marinero','minero','constructor','curandero','escriba','pastor','pescador','herrero']
+TRAITS=['prudente','ambicioso','leal','curioso','desconfiado','sociable','reservado','arriesgado','paciente','impulsivo']
+FIRST=['Aldo','Mara','Nolan','Iria','Tomas','Elian','Vera','Soren','Lia','Bran','Nadia','Oren','Celia','Darin','Mael','Rina','Galen','Talia','Ronan','Ema']
+LAST=['Ravel','Veyne','Orlan','Marek','Dorne','Valen','Rios','Alvar','Seren','Kerr','Mont','Arden','Falk','Neris','Vale']
+SCHEMA='''
+CREATE TABLE IF NOT EXISTS world(id INTEGER PRIMARY KEY CHECK(id=1),year INTEGER NOT NULL,day INTEGER NOT NULL,hour INTEGER NOT NULL,speed REAL NOT NULL DEFAULT 24,paused INTEGER NOT NULL DEFAULT 0,last_real REAL NOT NULL,treasury INTEGER NOT NULL,inflation REAL NOT NULL,created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS kingdoms(id INTEGER PRIMARY KEY,name TEXT UNIQUE,ruler TEXT,treasury INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS cities(id INTEGER PRIMARY KEY,kingdom_id INTEGER,name TEXT UNIQUE,description TEXT,population INTEGER DEFAULT 0,prosperity REAL DEFAULT 50,security REAL DEFAULT 70);
+CREATE TABLE IF NOT EXISTS families(id INTEGER PRIMARY KEY,surname TEXT,city_id INTEGER,wealth INTEGER DEFAULT 100,prestige REAL DEFAULT 10);
+CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY,kingdom_id INTEGER,city_id INTEGER,name TEXT,age INTEGER,sex TEXT,alive INTEGER DEFAULT 1,health REAL,wealth INTEGER,role TEXT,trait TEXT,ambition REAL,loyalty REAL,married_to INTEGER,father_id INTEGER,mother_id INTEGER,household_id INTEGER,status TEXT DEFAULT 'ciudadano');
+CREATE TABLE IF NOT EXISTS relationships(a INTEGER,b INTEGER,kind TEXT,strength REAL,trust REAL,resentment REAL,PRIMARY KEY(a,b));
+CREATE TABLE IF NOT EXISTS knowledge(person_id INTEGER,fact TEXT,truth INTEGER,source_id INTEGER,known_year INTEGER,known_day INTEGER,confidence REAL,PRIMARY KEY(person_id,fact));
+CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY,person_id INTEGER,event_id INTEGER,memory TEXT,importance REAL,year INTEGER,day INTEGER);
+CREATE TABLE IF NOT EXISTS businesses(id INTEGER PRIMARY KEY,city_id INTEGER,owner_id INTEGER,name TEXT,kind TEXT,workers INTEGER,cash INTEGER,inventory INTEGER,debt INTEGER,active INTEGER DEFAULT 1,reputation REAL DEFAULT 50);
+CREATE TABLE IF NOT EXISTS resources(id INTEGER PRIMARY KEY,city_id INTEGER,resource TEXT,quantity INTEGER,price REAL,demand REAL,capacity INTEGER,UNIQUE(city_id,resource));
+CREATE TABLE IF NOT EXISTS routes(id INTEGER PRIMARY KEY,origin INTEGER,dest INTEGER,distance INTEGER,security REAL,condition REAL,blocked INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS shipments(id INTEGER PRIMARY KEY,route_id INTEGER,resource TEXT,quantity INTEGER,days_left INTEGER,owner_id INTEGER,status TEXT DEFAULT 'moving');
+CREATE TABLE IF NOT EXISTS factions(id INTEGER PRIMARY KEY,kingdom_id INTEGER,name TEXT,influence REAL,goal TEXT,UNIQUE(kingdom_id,name));
+CREATE TABLE IF NOT EXISTS offices(id INTEGER PRIMARY KEY,kingdom_id INTEGER,name TEXT,holder_id INTEGER);
+CREATE TABLE IF NOT EXISTS armies(id INTEGER PRIMARY KEY,kingdom_id INTEGER,city_id INTEGER,name TEXT,soldiers INTEGER,morale REAL,supplies REAL,commander_id INTEGER);
+CREATE TABLE IF NOT EXISTS conflicts(id INTEGER PRIMARY KEY,name TEXT,kingdom_a INTEGER,kingdom_b INTEGER,city_id INTEGER,intensity REAL,cause TEXT,status TEXT,started_year INTEGER,started_day INTEGER,casualties INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS crimes(id INTEGER PRIMARY KEY,year INTEGER,day INTEGER,city_id INTEGER,actor_id INTEGER,victim_id INTEGER,kind TEXT,evidence REAL,status TEXT);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,year INTEGER,day INTEGER,hour INTEGER,category TEXT,importance INTEGER,title TEXT,description TEXT,cause TEXT,consequence TEXT);
+CREATE TABLE IF NOT EXISTS chronicles(id INTEGER PRIMARY KEY,year INTEGER,day INTEGER UNIQUE,text TEXT,created TEXT);
+CREATE TABLE IF NOT EXISTS interventions(id INTEGER PRIMARY KEY,year INTEGER,day INTEGER,action TEXT,target_type TEXT,target_id INTEGER,parameters TEXT,description TEXT,consequence TEXT);
+CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY,execute_year INTEGER,execute_day INTEGER,action TEXT,target_type TEXT,target_id INTEGER,parameters TEXT,description TEXT,active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS letters(id INTEGER PRIMARY KEY,year INTEGER,day INTEGER,recipient_id INTEGER,body TEXT,delivered INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS weather(id INTEGER PRIMARY KEY,city_id INTEGER,year INTEGER,day INTEGER,end_year INTEGER,end_day INTEGER,kind TEXT,intensity REAL,active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY,city_id INTEGER,name TEXT,cost INTEGER,progress REAL,required_days INTEGER,status TEXT DEFAULT 'planned');
+CREATE TABLE IF NOT EXISTS laws(id INTEGER PRIMARY KEY,kingdom_id INTEGER,name TEXT,effect TEXT,active INTEGER DEFAULT 1);
+CREATE INDEX IF NOT EXISTS ix_people_city ON people(city_id,alive); CREATE INDEX IF NOT EXISTS ix_events_date ON events(year,day,hour); CREATE INDEX IF NOT EXISTS ix_mem_person ON memories(person_id);
 '''
 
-
-def connect() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA busy_timeout=30000")
-    c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("PRAGMA foreign_keys=ON")
-    return c
-
+def con():
+ c=sqlite3.connect(DB,timeout=30,check_same_thread=False); c.row_factory=sqlite3.Row
+ c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA busy_timeout=30000'); c.execute('PRAGMA synchronous=NORMAL'); c.execute('PRAGMA foreign_keys=ON'); return c
 @contextmanager
 def db(write=False):
-    lock = DB_LOCK if write else threading.RLock()
-    with lock:
-        c = connect()
-        try:
-            if write: c.execute("BEGIN IMMEDIATE")
-            yield c
-            if write: c.commit()
-        except Exception:
-            if write: c.rollback()
-            raise
-        finally:
-            c.close()
+ with LOCK if write else threading.RLock():
+  c=con()
+  try:
+   if write:c.execute('BEGIN IMMEDIATE')
+   yield c
+   if write:c.commit()
+  except: 
+   if write:c.rollback()
+   raise
+  finally:c.close()
+def q(c,s,args=()): return c.execute(s,args)
+def ev(c,y,d,h,cat,imp,title,desc,cause='',consequence=''):
+ q(c,'INSERT INTO events(year,day,hour,category,importance,title,description,cause,consequence) VALUES(?,?,?,?,?,?,?,?,?)',(y,d,h,cat,imp,title,desc,cause,consequence))
 
-def now_iso(): return datetime.now(timezone.utc).isoformat()
+def seed(c):
+ if q(c,'SELECT COUNT(*) n FROM people').fetchone()['n']: return
+ now=time.time(); q(c,'INSERT INTO world VALUES(1,1,1,6,24,0,?,100000,0,?)',(now,datetime.now(timezone.utc).isoformat()))
+ # above placeholders: year day hour speed paused last treasury inflation created
+ q(c,'DELETE FROM world WHERE id=1'); q(c,'INSERT INTO world VALUES(1,1,1,6,24,0,?,100000,0,?)',(now,datetime.now(timezone.utc).isoformat()))
+ for x in KINGDOMS:q(c,'INSERT INTO kingdoms VALUES(?,?,?,?)',(x[0],x[1],x[2],50000))
+ for x in CITIES:q(c,'INSERT INTO cities VALUES(?,?,?,?,?,?,?)',(x[0],x[1],x[2],x[3],0,50,70))
+ rng=random.Random(424242)
+ for i in range(1,180):q(c,'INSERT INTO families VALUES(?,?,?,?,?)',(i,f'{rng.choice(LAST)}{i}',(i-1)%6+1,rng.randint(150,2000),rng.randint(10,60)))
+ pid=1
+ for kid in (1,2):
+  cityids=[x[0] for x in CITIES if x[1]==kid]
+  sexes=['M']*500+['F']*500; rng.shuffle(sexes)
+  for i,sx in enumerate(sexes):
+   age=rng.randint(18,72) if i<850 else rng.randint(1,17); role='estudiante' if age<18 else rng.choice(ROLES); fam=(pid-1)%179+1
+   surname=q(c,'SELECT surname FROM families WHERE id=?',(fam,)).fetchone()['surname']
+   q(c,'INSERT INTO people VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(pid,kid,cityids[i%3],f'{rng.choice(FIRST)} {surname}',age,sx,1,rng.randint(55,99),rng.randint(20,1800),role,rng.choice(TRAITS),rng.randint(10,95),rng.randint(20,95),None,None,None,fam,'ciudadano')); pid+=1
+ # coherent couples: adult opposite sex in same kingdom/city where possible
+ for kid in (1,2):
+  rows=q(c,'SELECT id,sex FROM people WHERE kingdom_id=? AND age>=18 ORDER BY city_id,id',(kid,)).fetchall(); males=[r['id'] for r in rows if r['sex']=='M']; females=[r['id'] for r in rows if r['sex']=='F']
+  for a,b in zip(males[:180],females[:180]):
+   q(c,'UPDATE people SET married_to=? WHERE id=?',(b,a)); q(c,'UPDATE people SET married_to=? WHERE id=?',(a,b)); strength=rng.randint(60,95)
+   q(c,'INSERT OR REPLACE INTO relationships VALUES(?,?,?,?,?,?)',(a,b,'pareja',strength,rng.randint(55,95),rng.randint(0,10))); q(c,'INSERT OR REPLACE INTO relationships VALUES(?,?,?,?,?,?)',(b,a,'pareja',strength,rng.randint(55,95),rng.randint(0,10)))
+ for cid,_,_,_ in CITIES:
+  for r in RES:q(c,'INSERT INTO resources(city_id,resource,quantity,price,demand,capacity) VALUES(?,?,?,?,?,?)',(cid,r,rng.randint(800,5000),round(rng.uniform(4,35),2),round(rng.uniform(.8,1.3),2),8000))
+  for b in range(4):
+   owner=q(c,'SELECT id FROM people WHERE city_id=? AND alive=1 ORDER BY RANDOM() LIMIT 1',(cid,)).fetchone()['id']; kind=rng.choice(['taller','tienda','granja','astillero']); q(c,'INSERT INTO businesses(city_id,owner_id,name,kind,workers,cash,inventory,debt) VALUES(?,?,?,?,?,?,?,?)',(cid,owner,f'Casa {rng.choice(FIRST)} {b}',kind,rng.randint(2,10),rng.randint(1000,7000),rng.randint(50,400),rng.randint(0,3000)))
+ routes=[(1,2,50),(2,3,70),(3,4,130),(4,5,80),(5,6,90),(6,1,160),(2,5,140)]
+ for i,(a,b,dist) in enumerate(routes,1):q(c,'INSERT INTO routes VALUES(?,?,?,?,?,?,?)',(i,a,b,dist,rng.randint(55,90),rng.randint(60,95),0))
+ factions=['Corona','Reformistas','Tradicionalistas']; goals=['preservar el orden','ampliar derechos','defender tradiciones']
+ for kid in (1,2):
+  for i,n in enumerate(factions):q(c,'INSERT INTO factions(kingdom_id,name,influence,goal) VALUES(?,?,?,?)',(kid,n,rng.randint(20,50),goals[i]))
+  for n in ['Consejero','Tesorero','Mariscal','Juez']: holder=q(c,'SELECT id FROM people WHERE kingdom_id=? AND age>=30 ORDER BY RANDOM() LIMIT 1',(kid,)).fetchone()['id']; q(c,'INSERT INTO offices(kingdom_id,name,holder_id) VALUES(?,?,?)',(kid,n,holder))
+  city=1 if kid==1 else 4; cmd=q(c,'SELECT id FROM people WHERE city_id=? AND age>=30 ORDER BY RANDOM() LIMIT 1',(city,)).fetchone()['id']; q(c,'INSERT INTO armies(kingdom_id,city_id,name,soldiers,morale,supplies,commander_id) VALUES(?,?,?,?,?,?,?)',(kid,city,'Guardia Real',700,80,90,cmd)); q(c,'INSERT INTO armies(kingdom_id,city_id,name,soldiers,morale,supplies,commander_id) VALUES(?,?,?,?,?,?,?)',(kid,city,'Ejército de Campaña',1800,75,85,cmd))
+ for p in q(c,'SELECT id FROM people').fetchall(): q(c,'INSERT INTO knowledge VALUES(?,?,?,?,?,?,?)',(p['id'],'El reino existe y la vida cotidiana continúa.',1,None,1,1,1.0))
+ ev(c,1,1,6,'fundación',100,'Comienza la era de Fénix','Aurelia y Valdoria entran en el primer día registrado de esta historia.','estado inicial','el mundo queda listo para evolucionar')
 
-def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with DB_LOCK:
-        c = connect()
-        c.executescript(SCHEMA)
-        if c.execute("SELECT 1 FROM world_state WHERE id=1").fetchone() is None:
-            c.execute("INSERT INTO world_state VALUES(1,1,1,?,?,0,100000,0,?)", (time.time(),24.0,now_iso()))
-            for kid,name,ruler in KINGDOMS: c.execute("INSERT INTO kingdoms(id,name,ruler) VALUES(?,?,?)",(kid,name,ruler))
-            for cid,kid,name,desc in CITIES: c.execute("INSERT INTO cities(id,kingdom_id,name,description) VALUES(?,?,?,?)", (cid,kid,name,desc))
-        c.commit(); c.close()
-    seed_world()
+@app.on_event('startup')
+def startup():
+ DB.parent.mkdir(parents=True,exist_ok=True)
+ with LOCK:
+  c=con(); c.executescript(SCHEMA); seed(c); c.commit(); c.close()
 
-def seed_world():
-    with db(write=True) as c:
-        if c.execute("SELECT COUNT(*) n FROM people").fetchone()["n"] > 0:
-            return
-        random.seed(424242)
-        # 17 districts and exactly 63 properties.
-        district_plan = {1:3, 2:3, 3:3, 4:3, 5:3, 6:2}
-        prop_plan = {1:11, 2:11, 3:11, 4:10, 5:10, 6:10}
-        did=1; pid=1
-        for cid,_,_,_ in CITIES:
-            remaining=prop_plan[cid]
-            for j in range(district_plan[cid]):
-                c.execute("INSERT INTO districts(id,city_id,name) VALUES(?,?,?)",(did,cid,f"Distrito {j+1}"))
-                take = remaining if j == district_plan[cid]-1 else max(1, remaining//(district_plan[cid]-j))
-                remaining -= take
-                for k in range(take):
-                    kind=["vivienda","taller","granja","comercio","almacen"][k%5]
-                    c.execute("INSERT INTO properties(id,city_id,district_id,kind,value) VALUES(?,?,?,?,?)",(pid,cid,did,kind,random.randint(80,900)))
-                    pid+=1
-                did+=1
-        # Exactly 179 families.
-        for fid in range(1,180):
-            cid=CITIES[(fid-1)%len(CITIES)][0]
-            surname=f"{LAST[(fid-1)%len(LAST)]}{fid}"
-            c.execute("INSERT INTO families(id,surname,city_id,wealth) VALUES(?,?,?,?)",(fid,surname,cid,random.randint(100,1500)))
-        # Exactly 2,000 humans: 1,000 per kingdom, 500 male + 500 female per kingdom.
-        people_by_city={cid:[] for cid,_,_,_ in CITIES}
-        person_id=1
-        for kid in [1,2]:
-            city_ids=[x[0] for x in CITIES if x[1]==kid]
-            sexes=["M"]*500+["F"]*500
-            random.shuffle(sexes)
-            for i,sex in enumerate(sexes):
-                cid=city_ids[i%3]
-                age=random.randint(18,72) if i<850 else random.randint(1,17)
-                role="estudiante" if age<18 else random.choice(ROLES)
-                fam=((person_id-1)%179)+1
-                surname=c.execute("SELECT surname FROM families WHERE id=?",(fam,)).fetchone()["surname"]
-                name=f"{random.choice(FIRST)} {surname}"
-                c.execute("INSERT INTO people(id,kingdom_id,city_id,name,age,sex,health,wealth,role,trait,ambition,loyalty,household_id,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (person_id,kid,cid,name,age,sex,random.randint(55,99),random.randint(5,1800),role,random.choice(TRAITS),random.randint(10,95),random.randint(15,95),fam,"ciudadano"))
-                people_by_city[cid].append(person_id)
-                person_id+=1
-        # Pair adults and create family/relationship links where possible.
-        adults=[r["id"] for r in c.execute("SELECT id FROM people WHERE age>=18 ORDER BY id")]
-        for i in range(0,min(600,len(adults)-1),2):
-            a,b=adults[i],adults[i+1]
-            c.execute("INSERT OR IGNORE INTO relationships VALUES(?,?,?,?)",(a,b,"pareja",random.randint(50,95)))
-            c.execute("INSERT OR IGNORE INTO relationships VALUES(?,?,?,?)",(b,a,"pareja",random.randint(50,95)))
-            c.execute("UPDATE people SET married_to=? WHERE id=?",(b,a)); c.execute("UPDATE people SET married_to=? WHERE id=?",(a,b))
-        # Individual knowledge and memory exist from birth onward.
-        for p in c.execute("SELECT id FROM people").fetchall():
-            c.execute("INSERT OR IGNORE INTO knowledge VALUES(?,?,1,NULL,1)",(p["id"],"El reino existe y la vida cotidiana continúa."))
-            c.execute("INSERT INTO memories(person_id,event_id,memory,importance,created_day) VALUES(?,?,?,?,?)",(p["id"],None,"Recuerdos tempranos de su vida cotidiana.",20,1))
-        # 24 businesses, 36 resource markets, 6 cities.
-        for cid,_,_,_ in CITIES:
-            for r in RESOURCES:
-                c.execute("INSERT INTO resources(city_id,resource,quantity,price,demand) VALUES(?,?,?,?,?)",(cid,r,random.randint(300,3000),round(random.uniform(4,40),2),round(random.uniform(.7,1.4),2)))
-            for b in range(4):
-                owner=random.choice(people_by_city[cid]); c.execute("INSERT INTO businesses(city_id,owner_id,name,kind,workers,cash) VALUES(?,?,?,?,?,?)",(cid,owner,f"Casa {random.choice(FIRST)} {b}",random.choice(["taller","tienda","granja","astillero"]),random.randint(1,8),random.randint(500,6000)))
-        # 7 routes.
-        routes=[(1,2),(2,3),(3,4),(4,5),(5,6),(6,1),(2,5)]
-        for rid,(a,b) in enumerate(routes,1): c.execute("INSERT INTO routes VALUES(?,?,?,?,?,?)",(rid,a,b,random.randint(30,180),random.randint(55,90),random.randint(60,95)))
-        # 6 factions (3 per kingdom) and 8 offices (4 per kingdom).
-        fid=1
-        for kid in [1,2]:
-            for fn in FACTION_NAMES:
-                c.execute("INSERT INTO factions(id,kingdom_id,name,influence) VALUES(?,?,?,?)",(fid,kid,fn,random.randint(20,50))); fid+=1
-            city=1 if kid==1 else 4
-            holder=random.choice(people_by_city[city])
-            for on in ["Consejero Real","Tesorería","Comandante","Justicia"]:
-                c.execute("INSERT INTO offices(kingdom_id,name,holder_id) VALUES(?,?,?)",(kid,on,holder))
-        # Exactly 40 nobles.
-        noble_ids=[r["id"] for r in c.execute("SELECT id FROM people WHERE age>=18 ORDER BY id LIMIT 40")]
-        for n,pid0 in enumerate(noble_ids,1):
-            c.execute("INSERT INTO nobles(person_id,title,house,power) VALUES(?,?,?,?)",(pid0,random.choice(["Duque","Conde","Marqués","Barón"]),f"Casa {LAST[n%len(LAST)]}{n}",random.randint(40,95)))
-            c.execute("UPDATE people SET status='noble' WHERE id=?",(pid0,))
-        c.execute("UPDATE cities SET population=(SELECT COUNT(*) FROM people WHERE people.city_id=cities.id AND alive=1)")
-        add_event(c,1,1,"fundación",80,"Comienza la era de Reino Fénix","Las dos coronas y sus ciudades entran en una etapa de paz vigilada.","fundación","Instituciones, familias y mercados comienzan a operar.")
-        make_chronicle(c,1,1)
+def world(c):return q(c,'SELECT * FROM world WHERE id=1').fetchone()
+def next_date(y,d): return (y+1,1) if d>=360 else (y,d+1)
+def process_day(c,y,d):
+ rng=random.Random(y*100000+d); actions=[]
+ # age only at day 360
+ if d==360:q(c,'UPDATE people SET age=age+1 WHERE alive=1')
+ # households, work, consumption, relationships
+ for p in q(c,'SELECT * FROM people WHERE alive=1').fetchall():
+  if p['age']<18: continue
+  income=rng.randint(0,18)+(3 if p['role'] in ('mercader','herrero','minero') else 0)
+  expense=rng.randint(1,10); nw=max(0,p['wealth']+income-expense)
+  health=max(0,min(100,p['health']+rng.uniform(-.25,.18)))
+  q(c,'UPDATE people SET wealth=?,health=? WHERE id=?',(nw,health,p['id']))
+  if health<5 and rng.random()<.03:q(c,'UPDATE people SET alive=0,status=? WHERE id=?',('fallecido',p['id'])); ev(c,y,d,rng.randrange(24),'muerte',65,f'Muere {p["name"]}',f'{p["name"]} fallece tras un deterioro de salud.','salud','su familia y relaciones quedan afectadas'); actions.append('death')
+ # births, max 2% yearly household chance via married couples
+ if d%30==0:
+  couples=q(c,"SELECT a,b FROM relationships WHERE kind='pareja' AND a<b AND strength>55").fetchall()
+  for cp in rng.sample(couples,min(len(couples),8)):
+   if rng.random()<.22:
+    mom=q(c,'SELECT * FROM people WHERE id=? AND alive=1',(cp['b'],)).fetchone(); dad=q(c,'SELECT * FROM people WHERE id=? AND alive=1',(cp['a'],)).fetchone()
+    if mom and dad and mom['sex']=='F' and 18<=mom['age']<=45:
+     sex=rng.choice(['M','F']); pid=q(c,'SELECT COALESCE(MAX(id),0)+1 n FROM people').fetchone()['n']; fam=mom['household_id']; name=f'{rng.choice(FIRST)} {q(c,"SELECT surname FROM families WHERE id=?",(fam,)).fetchone()["surname"]}'
+     q(c,'INSERT INTO people VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(pid,mom['kingdom_id'],mom['city_id'],name,0,sex,1,98,0,'estudiante',rng.choice(TRAITS),rng.randint(10,60),rng.randint(40,90),None,dad['id'],mom['id'],fam,'ciudadano')); ev(c,y,d,10,'familia',45,'Nace un niño',f'{name} nace en {q(c,"SELECT name FROM cities WHERE id=?",(mom["city_id"],)).fetchone()["name"]}.','formación familiar','la familia incorpora una nueva generación'); actions.append('birth')
+ # markets and business flows
+ for r in q(c,'SELECT * FROM resources').fetchall():
+  local_demand=r['demand']*(1+rng.uniform(-.04,.04)); qty=max(0,r['quantity']+rng.randint(-80,120)); price=max(.5,r['price']*(1+(local_demand-1)*.08+rng.uniform(-.015,.015))); q(c,'UPDATE resources SET quantity=?,demand=?,price=? WHERE id=?',(qty,local_demand,price,r['id']))
+ for b in q(c,'SELECT * FROM businesses WHERE active=1').fetchall():
+  production=max(1,b['workers']*rng.randint(1,4)); sales=min(b['inventory']+production,rng.randint(10,80)); revenue=sales*rng.randint(3,15); wage=b['workers']*rng.randint(1,4); cash=b['cash']+revenue-wage-rng.randint(0,20); inv=max(0,b['inventory']+production-sales)
+  debt=b['debt'];
+  if cash<0: debt+=abs(cash); cash=0
+  active=1 if debt<max(100,b['workers']*1000) else 0
+  q(c,'UPDATE businesses SET cash=?,inventory=?,debt=?,active=? WHERE id=?',(cash,inv,debt,active,b['id']))
+  if not active: ev(c,y,d,15,'economia',55,'Una empresa cierra',f'{b["name"]} deja de operar tras acumular deudas.','insolvencia','sus trabajadores deben buscar otro empleo')
+ # shipments
+ for s in q(c,"SELECT * FROM shipments WHERE status='moving'").fetchall():
+  left=s['days_left']-1
+  if left<=0:
+   rt=q(c,'SELECT * FROM routes WHERE id=?',(s['route_id'],)).fetchone(); q(c,'UPDATE shipments SET days_left=0,status=? WHERE id=?',('delivered',s['id'])); q(c,'UPDATE resources SET quantity=MIN(capacity,quantity+?) WHERE city_id=? AND resource=?',(s['quantity'],rt['dest'],s['resource']))
+  else:q(c,'UPDATE shipments SET days_left=? WHERE id=?',(left,s['id']))
+ # conflicts
+ for f in q(c,"SELECT * FROM conflicts WHERE status='active'").fetchall():
+  delta=rng.uniform(-6,6); intensity=max(0,min(100,f['intensity']+delta)); casualties=0
+  if intensity>45 and rng.random()<.25: casualties=rng.randint(0,8); q(c,'UPDATE conflicts SET casualties=casualties+?,intensity=? WHERE id=?',(casualties,intensity,f['id'])); ev(c,y,d,20,'guerra',70,f'Combate en {f["name"]}',f'El conflicto deja {casualties} bajas registradas.','hostilidades','aumenta la presión sobre recursos y familias')
+  else:q(c,'UPDATE conflicts SET intensity=? WHERE id=?',(intensity,f['id']))
+  if intensity<3 and rng.random()<.2:q(c,'UPDATE conflicts SET status=? WHERE id=?',('ended',f['id'])); ev(c,y,d,20,'diplomacia',65,f'Termina {f["name"]}','La intensidad cae y las partes dejan de combatir activamente.','agotamiento','comienza una etapa de negociación')
+ # treasury/inflation tied to activity, not pure random
+ tax=sum(q(c,'SELECT wealth FROM people WHERE alive=1 AND age>=18').fetchall(),0) if False else q(c,'SELECT COALESCE(SUM(wealth),0) s FROM people WHERE alive=1 AND age>=18').fetchone()['s']
+ revenue=int(tax*.0008); spending=q(c,'SELECT COUNT(*) n FROM armies').fetchone()['n']*12; w=world(c); treasury=max(0,w['treasury']+revenue-spending); inflation=max(-.1,min(.5,w['inflation']+(spending-revenue)/max(1,treasury)*.0002)); q(c,'UPDATE world SET treasury=?,inflation=? WHERE id=1',(treasury,inflation))
+ # city aggregates
+ for city in CITIES:q(c,'UPDATE cities SET population=(SELECT COUNT(*) FROM people WHERE city_id=? AND alive=1),prosperity=MAX(0,MIN(100,prosperity+?)) WHERE id=?',(city[0],rng.uniform(-.15,.2),city[0]))
+ return actions
 
-def add_event(c,year,day,category,importance,title,description,cause=None,consequence=None):
-    c.execute("INSERT INTO events(year,day,category,importance,title,description,cause,consequence) VALUES(?,?,?,?,?,?,?,?)",(year,day,category,importance,title,description,cause,consequence))
+def chronicle(c,y,d):
+ rows=q(c,'SELECT * FROM events WHERE year=? AND day=? ORDER BY importance DESC,hour,id',(y,d)).fetchall(); w=world(c); pop=q(c,'SELECT COUNT(*) n FROM people WHERE alive=1').fetchone()['n']; avg=q(c,'SELECT COALESCE(AVG(wealth),0) a FROM people WHERE alive=1').fetchone()['a']; active=q(c,'SELECT COUNT(*) n FROM businesses WHERE active=1').fetchone()['n']; conflicts=q(c,"SELECT COUNT(*) n FROM conflicts WHERE status='active'").fetchone()['n']
+ parts=[f'En el día {d} del año {y}, el mundo continúa su evolución. La población viva es de {pop} personas y la riqueza media individual ronda {avg:.0f} monedas. Hay {active} empresas activas y {conflicts} conflictos abiertos.']
+ for r in rows[:8]:parts.append(f'[{r["category"]}] {r["title"]}: {r["description"]} Causa: {r["cause"]}. Consecuencia registrada: {r["consequence"]}.')
+ if not rows:parts.append('La jornada transcurre sin un acontecimiento extraordinario registrado, mientras las actividades económicas, familiares y sociales continúan.')
+ text=' '.join(parts); q(c,'INSERT OR REPLACE INTO chronicles(year,day,text,created) VALUES(?,?,?,?)',(y,d,text,datetime.now(timezone.utc).isoformat())); return text
 
-def advance_date(year,day,days=1):
-    total=(year-1)*365+(day-1)+days
-    return total//365+1,total%365+1
+def run_days(n):
+ n=max(0,min(int(n),3650)); out=[]
+ with ENGINE,db(True) as c:
+  w=world(c)
+  for _ in range(n):
+   y,d=w['year'],w['day']; process_day(c,y,d); out.append(chronicle(c,y,d)); y,d=next_date(y,d); q(c,'UPDATE world SET year=?,day=?,hour=6,last_real=? WHERE id=1',(y,d,time.time())); w=world(c)
+ return out
 
-def get_world(c):
-    w=c.execute("SELECT * FROM world_state WHERE id=1").fetchone()
-    pop=c.execute("SELECT COUNT(*) n FROM people WHERE alive=1").fetchone()["n"]
-    avgw=c.execute("SELECT COALESCE(AVG(wealth),0) x FROM people WHERE alive=1").fetchone()["x"]
-    return {"year":w["year"],"day":w["day"],"population":pop,"avg_wealth":round(avgw,1),"treasury":w["treasury"],"inflation":round(w["inflation"],2),"speed":w["speed"],"paused":bool(w["paused"]),"kingdoms":[dict(r) for r in c.execute("SELECT * FROM kingdoms")],"cities":[dict(r) for r in c.execute("SELECT * FROM cities")],"conflicts":[dict(r) for r in c.execute("SELECT * FROM conflicts WHERE status='active' ORDER BY intensity DESC")],"events":[dict(r) for r in c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 15")],"chronicle": c.execute("SELECT text FROM chronicles ORDER BY id DESC LIMIT 1").fetchone()["text"]}
+def catchup():
+ with ENGINE,db(True) as c:
+  w=world(c)
+  if w['paused']:return
+  elapsed=(time.time()-w['last_real'])/3600*w['speed']; days=min(30,int(elapsed))
+ if days:run_days(days)
 
-def process_day(c,year,day):
-    random.seed(year*1000+day)
-    actions={"work":0,"study":0,"trade":0,"conversation":0,"travel":0}
-    alive=list(c.execute("SELECT id,city_id,age,wealth,health,role,trait FROM people WHERE alive=1"))
-    for p in alive:
-        if p["age"]<18: actions["study"]+=1
-        else:
-            actions["work"]+=1
-            delta=random.randint(0,20)
-            c.execute("UPDATE people SET wealth=MAX(0,wealth+?), health=MIN(100,MAX(0,health+?)) WHERE id=?",(delta,random.choice([-1,0,0,0,1]),p["id"]))
-            if random.random()<0.002:
-                c.execute("UPDATE people SET health=health-? WHERE id=?",(random.randint(5,20),p["id"]))
-        if random.random()<.15: actions["conversation"]+=1
-    # market
-    for r in c.execute("SELECT id,city_id,resource,quantity,price,demand FROM resources"):
-        change=random.uniform(-.03,.03)+(r["demand"]-1)*.02
-        new_price=max(.5,r["price"]*(1+change)); qty=max(0,r["quantity"]+random.randint(-40,50))
-        demand=min(2,max(.5,r["demand"]+random.uniform(-.04,.04)))
-        c.execute("UPDATE resources SET quantity=?,price=?,demand=? WHERE id=?",(qty,new_price,demand,r["id"]))
-    # shipments
-    for s in c.execute("SELECT * FROM shipments WHERE status='moving'").fetchall():
-        left=s["days_left"]-1
-        if left<=0:
-            c.execute("UPDATE shipments SET days_left=0,status='delivered' WHERE id=?",(s["id"],));
-            route=c.execute("SELECT * FROM routes WHERE id=?",(s["route_id"],)).fetchone(); c.execute("UPDATE resources SET quantity=quantity+? WHERE city_id=? AND resource=?",(s["quantity"],route["dest_city"],s["resource"]))
-            add_event(c,year,day,"comercio",30,"Llega un cargamento",f"Un cargamento de {s['quantity']} unidades de {s['resource']} llega a su destino.","ruta comercial","Aumenta temporalmente la oferta local.")
-        else: c.execute("UPDATE shipments SET days_left=? WHERE id=?",(left,s["id"]))
-    # rare births/deaths
-    if day%30==0:
-        adult=c.execute("SELECT * FROM people WHERE alive=1 AND age BETWEEN 20 AND 42 ORDER BY RANDOM() LIMIT 1").fetchone()
-        if adult and random.random()<.65:
-            surname=adult["name"].split()[-1]; name=f"{random.choice(FIRST)} {surname}"
-            c.execute("INSERT INTO people(kingdom_id,city_id,name,age,sex,health,wealth,role,trait,ambition,loyalty,household_id,mother_id) VALUES((SELECT kingdom_id FROM people WHERE id=?),(SELECT city_id FROM people WHERE id=?),?,?,?,?,?,?,?,?,?,?,?)",(adult["id"],adult["id"],name,0,random.choice(["M","F"]),95,10,"infante",random.choice(TRAITS),10,70,adult["household_id"],adult["id"]))
-            add_event(c,year,day,"familia",45,"Nace un niño",f"Nace {name}; una familia incorpora una nueva generación.","familia","Cambian las responsabilidades del hogar.")
-    # conflict evolution
-    for cf in c.execute("SELECT * FROM conflicts WHERE status='active'").fetchall():
-        roll=random.random()
-        if roll<.05:
-            casualties=random.randint(0,max(1,cf["intensity"]//10)); c.execute("UPDATE conflicts SET casualties=casualties+?, intensity=MIN(100,intensity+?) WHERE id=?",(casualties,random.randint(1,6),cf["id"]))
-            add_event(c,year,day,"conflicto",cf["intensity"],f"Escala el conflicto {cf['name']}",f"La tensión entre {cf['side_a']} y {cf['side_b']} provoca nuevas pérdidas y presión política.",cf["cause"],"Aumenta la inestabilidad local.")
-        elif roll<.08:
-            c.execute("UPDATE conflicts SET intensity=MAX(0,intensity-8) WHERE id=?",(cf["id"],))
-    # weather effects
-    c.execute("UPDATE divine_weather SET active=0 WHERE active=1 AND ((year<?) OR (year=? AND end_day<?))",(year,year,day))
-    w=c.execute("SELECT * FROM world_state WHERE id=1").fetchone()
-    treasury_delta=random.randint(-250,450)
-    c.execute("UPDATE world_state SET treasury=MAX(0,treasury+?), inflation=MIN(50,MAX(0,inflation+?)) WHERE id=1",(treasury_delta,random.uniform(-.03,.04)))
-    c.execute("UPDATE cities SET population=(SELECT COUNT(*) FROM people WHERE people.city_id=cities.id AND alive=1)")
-    return actions
+class Advance(BaseModel): days:int=Field(ge=1,le=3650)
+class Speed(BaseModel): speed:float=Field(ge=0,le=365)
+class Divine(BaseModel): action:str; target_type:str='person'; target_id:int=0; parameters:dict[str,object]={}; description:str='Intervención divina'
+class Schedule(BaseModel): execute_year:int; execute_day:int; action:str; target_type:str='person'; target_id:int=0; parameters:dict[str,object]={}; description:str='Intervención programada'
 
-def make_chronicle(c,year,day):
-    events=list(c.execute("SELECT * FROM events WHERE year=? AND day=? ORDER BY importance DESC,id",(year,day)))
-    pop=c.execute("SELECT COUNT(*) n FROM people WHERE alive=1").fetchone()["n"]
-    avgw=c.execute("SELECT COALESCE(AVG(wealth),0) x FROM people WHERE alive=1").fetchone()["x"]
-    businesses=c.execute("SELECT COUNT(*) n FROM businesses WHERE active=1").fetchone()["n"]
-    conflicts=c.execute("SELECT COUNT(*) n FROM conflicts WHERE status='active'").fetchone()["n"]
-    res=list(c.execute("SELECT city_id,resource,price,demand FROM resources ORDER BY demand DESC LIMIT 3"))
-    text=f"Día {day} del año {year}. Han transcurrido 24 horas dentro de Reino Fénix. La población viva es de {pop:,} personas y la riqueza media individual ronda {avgw:.0f} monedas. Hay {businesses} negocios activos y {conflicts} conflictos abiertos.\n\n"
-    if events:
-        text += "Durante la jornada: " + " ".join(e["description"] for e in events[:5]) + "\n\n"
-    else: text += "No se registró un acontecimiento extraordinario de alta importancia; la vida cotidiana continuó entre trabajo, estudio, comercio, relaciones y decisiones privadas.\n\n"
-    if res: text += "Mercados bajo presión: " + ", ".join(f"{r['resource']} (demanda {r['demand']:.2f}, precio {r['price']:.1f})" for r in res) + ".\n\n"
-    text += "La crónica describe hechos registrados por el motor. La información divina permanece separada del conocimiento de los habitantes."
-    c.execute("INSERT OR REPLACE INTO chronicles(year,day,text,created_at) VALUES(?,?,?,?)",(year,day,text,now_iso()))
-    return text
-
-def process_schedules(c):
-    w=c.execute("SELECT year,day FROM world_state WHERE id=1").fetchone(); due=c.execute("SELECT * FROM divine_schedules WHERE active=1 AND (execute_year<? OR (execute_year=? AND execute_day<=?))",(w["year"],w["year"],w["day"])).fetchall()
-    for s in due:
-        execute_divine_locked(c,s["action"],s["target_type"],s["target_id"],json.loads(s["parameters"]),s["description"],record_day=(w["year"],w["day"]))
-        c.execute("UPDATE divine_schedules SET active=0 WHERE id=?",(s["id"],))
-
-def execute_divine_locked(c,action,target_type,target_id,params,description="",record_day=None):
-    w=c.execute("SELECT year,day FROM world_state WHERE id=1").fetchone(); y,d=record_day or (w["year"],w["day"]); consequence=""
-    if target_type=="person":
-        p=c.execute("SELECT * FROM people WHERE id=?",(target_id,)).fetchone()
-        if not p: raise HTTPException(404,"Persona no encontrada")
-    if action=="wealth":
-        amount=int(params.get("amount",0));
-        if amount<0: raise HTTPException(400,"La riqueza debe ser positiva")
-        c.execute("UPDATE people SET wealth=wealth+? WHERE id=?",(amount,target_id)); consequence=f"{p['name']} recibió {amount} monedas. Su patrimonio pasó de {p['wealth']} a {p['wealth']+amount}."
-    elif action=="kill":
-        c.execute("UPDATE people SET alive=0,status='muerto' WHERE id=?",(target_id,)); consequence=f"{p['name']} murió por una intervención divina. El resto del mundo no conoce la causa sobrenatural."
-        add_event(c,y,d,"muerte",80,"Una vida termina",consequence,"intervención divina","La familia, propiedades y relaciones quedan expuestas a consecuencias posteriores.")
-    elif action=="save":
-        c.execute("UPDATE people SET alive=1,health=MAX(health,70),status='ciudadano' WHERE id=?",(target_id,)); consequence=f"{p['name']} fue salvado y recuperó su condición vital."
-    elif action=="health":
-        amount=max(0,min(100,int(params.get("health",100)))); c.execute("UPDATE people SET health=? WHERE id=?",(amount,target_id)); consequence=f"La salud de {p['name']} quedó en {amount}/100."
-    elif action=="relation":
-        a=int(params.get("person_a",target_id)); b=int(params.get("person_b",0)); strength=max(-100,min(100,int(params.get("strength",0)))); kind=params.get("kind","relación");
-        if not b or not c.execute("SELECT 1 FROM people WHERE id=?",(b,)).fetchone(): raise HTTPException(400,"La segunda persona no existe")
-        c.execute("INSERT INTO relationships VALUES(?,?,?,?) ON CONFLICT(person_a,person_b) DO UPDATE SET kind=excluded.kind,strength=excluded.strength",(a,b,kind,strength)); consequence=f"La relación entre dos habitantes fue alterada a {strength}/100 ({kind})."
-    elif action=="reveal":
-        fact=str(params.get("fact","")).strip();
-        if not fact: raise HTTPException(400,"Falta la información a revelar")
-        c.execute("INSERT INTO knowledge(person_id,fact,truth,source_person_id,known_day) VALUES(?,?,1,NULL,?) ON CONFLICT(person_id,fact) DO UPDATE SET truth=1,known_day=excluded.known_day",(target_id,fact,d)); consequence=f"{p['name']} ahora conoce: {fact}"
-    elif action=="erase":
-        fact=str(params.get("fact","")).strip(); c.execute("DELETE FROM knowledge WHERE person_id=? AND fact=?",(target_id,fact)); consequence=f"Se eliminó de la memoria de conocimiento de {p['name']} el hecho indicado."
-    elif action=="letter":
-        body=str(params.get("body","")).strip(); sender=str(params.get("sender","Una voz desconocida")).strip(); c.execute("INSERT INTO divine_letters(year,day,recipient_id,sender_text,body) VALUES(?,?,?,?,?)",(y,d,target_id,sender,body)); consequence=f"Una carta fue entregada a {p['name']} con remitente aparente '{sender}'."
-    elif action=="weather":
-        weather=str(params.get("weather","lluvia")); intensity=max(1,min(100,int(params.get("intensity",50)))); duration=max(1,int(params.get("duration",1))); city_id=int(params.get("city_id",0)) or None; end_day=d+duration; c.execute("INSERT INTO divine_weather(year,day,city_id,weather,intensity,end_day) VALUES(?,?,?,?,?,?)",(y,d,city_id,weather,intensity,end_day)); consequence=f"El clima cambió a {weather} con intensidad {intensity} durante {duration} día(s)."
-    elif action=="resource":
-        resource=str(params.get("resource","grano")); qty=max(1,int(params.get("quantity",1))); city_id=int(params.get("city_id",1)); c.execute("UPDATE resources SET quantity=quantity+? WHERE city_id=? AND resource=?",(qty,city_id,resource)); consequence=f"Aparecieron {qty} unidades adicionales de {resource}."
-    elif action=="conflict":
-        name=str(params.get("name","Conflicto divino")); a=str(params.get("side_a","Facción A")); b=str(params.get("side_b","Facción B")); intensity=max(1,min(100,int(params.get("intensity",50)))); cause=str(params.get("cause","Una causa desconocida para los habitantes.")); c.execute("INSERT INTO conflicts(name,side_a,side_b,intensity,cause,started_day) VALUES(?,?,?,?,?,?)",(name,a,b,intensity,cause,d)); consequence=f"Comenzó el conflicto '{name}' entre {a} y {b}."
-    else: raise HTTPException(400,"Acción divina no reconocida")
-    c.execute("INSERT INTO divine_interventions(year,day,action,target_type,target_id,parameters,description,consequence) VALUES(?,?,?,?,?,?,?,?)",(y,d,action,target_type,target_id,json.dumps(params,ensure_ascii=False),description or action,consequence))
-    return consequence
-
-def simulate(days:int):
-    days=max(0,int(days));
-    with ENGINE_LOCK, db(write=True) as c:
-        w=c.execute("SELECT * FROM world_state WHERE id=1").fetchone()
-        y,d=w["year"],w["day"]
-        if w["paused"]: return get_world(c)
-        for _ in range(days):
-            y,d=advance_date(y,d,1); process_day(c,y,d); process_schedules(c); make_chronicle(c,y,d)
-        c.execute("UPDATE world_state SET year=?,day=?,last_real=? WHERE id=1",(y,d,time.time()))
-        return get_world(c)
-
-def catch_up():
-    with ENGINE_LOCK:
-        with db(write=True) as c:
-            w=c.execute("SELECT * FROM world_state WHERE id=1").fetchone()
-            if w["paused"]: return
-            elapsed=max(0,time.time()-w["last_real"])
-            # speed = simulated days per real hour. Default 24 => 1 sim day/hour.
-            days=int(elapsed/3600*w["speed"])
-            if days>0:
-                y,d=w["year"],w["day"]
-                for _ in range(min(days,3650)):
-                    y,d=advance_date(y,d,1); process_day(c,y,d); process_schedules(c); make_chronicle(c,y,d)
-                c.execute("UPDATE world_state SET year=?,day=?,last_real=? WHERE id=1",(y,d,time.time()))
-            else:
-                c.execute("UPDATE world_state SET last_real=? WHERE id=1",(time.time(),))
-
-@app.on_event("startup")
-def startup(): init_db()
-
-class DivineAction(BaseModel):
-    action:str
-    target_type:str="world"
-    target_id:int=0
-    parameters:dict[str,Any]=Field(default_factory=dict)
-    description:str=""
-class AdvanceRequest(BaseModel): days:int=Field(default=1,ge=1,le=3650)
-class ScheduleRequest(DivineAction): execute_in_days:int=Field(default=1,ge=1,le=3650)
-
-@app.get("/health")
-def health():
-    with db() as c:
-        w=c.execute("SELECT year,day FROM world_state WHERE id=1").fetchone()
-        return {"ok":True,"service":"reino-fenix","year":w["year"],"day":w["day"]}
-
-@app.get("/",response_class=HTMLResponse)
-def home(): return HTML
-
-@app.get("/api/world")
+@app.get('/health')
+def health():return {'ok':True,'world':'Reino Fénix'}
+@app.get('/api/world')
 def api_world():
-    catch_up()
-    with db() as c: return get_world(c)
-
-@app.get("/api/people")
-def people(q:str="",city_id:int=0,limit:int=100):
-    catch_up()
-    with db() as c:
-        rows=c.execute("SELECT id,name,age,sex,city_id,kingdom_id,health,wealth,role,trait,ambition,loyalty,alive,status FROM people WHERE (?='' OR name LIKE ?) AND (?=0 OR city_id=?) ORDER BY alive DESC,name LIMIT ?",(q,f"%{q}%",city_id,city_id,min(limit,500))).fetchall()
-        return [dict(r) for r in rows]
-
-@app.get("/api/people/{pid}")
-def person(pid:int):
-    catch_up()
-    with db() as c:
-        p=c.execute("SELECT p.*,c.name city_name,k.name kingdom_name FROM people p JOIN cities c ON c.id=p.city_id JOIN kingdoms k ON k.id=p.kingdom_id WHERE p.id=?",(pid,)).fetchone()
-        if not p: raise HTTPException(404,"Persona no encontrada")
-        d=dict(p); d["relationships"]=[dict(r) for r in c.execute("SELECT r.*,p.name other_name FROM relationships r JOIN people p ON p.id=r.person_b WHERE r.person_a=?",(pid,))]; d["knowledge"]=[dict(r) for r in c.execute("SELECT fact,truth,known_day FROM knowledge WHERE person_id=?",(pid,))]; return d
-
-@app.get("/api/cities")
-def cities():
-    catch_up()
-    with db() as c: return [dict(r) for r in c.execute("SELECT c.*,k.name kingdom_name FROM cities c JOIN kingdoms k ON k.id=c.kingdom_id ORDER BY c.id")]
-
-@app.get("/api/layers")
-def layers():
-    catch_up()
-    with db() as c:
-        return {"cities":[dict(r) for r in c.execute("SELECT * FROM cities")],"resources":[dict(r) for r in c.execute("SELECT * FROM resources")],"routes":[dict(r) for r in c.execute("SELECT * FROM routes")],"factions":[dict(r) for r in c.execute("SELECT * FROM factions")],"offices":[dict(r) for r in c.execute("SELECT * FROM offices")],"nobles":[dict(r) for r in c.execute("SELECT * FROM nobles")],"businesses":[dict(r) for r in c.execute("SELECT * FROM businesses")],"conflicts":[dict(r) for r in c.execute("SELECT * FROM conflicts")],"families":c.execute("SELECT COUNT(*) n FROM families").fetchone()["n"],"properties":c.execute("SELECT COUNT(*) n FROM properties").fetchone()["n"]}
-
-@app.post("/api/advance")
-def advance(req:AdvanceRequest): return simulate(req.days)
-
-@app.post("/api/pause")
-def pause():
-    with ENGINE_LOCK, db(write=True) as c: c.execute("UPDATE world_state SET paused=1,last_real=? WHERE id=1",(time.time(),)); return get_world(c)
-@app.post("/api/resume")
-def resume():
-    with ENGINE_LOCK, db(write=True) as c: c.execute("UPDATE world_state SET paused=0,last_real=? WHERE id=1",(time.time(),)); return get_world(c)
-@app.post("/api/speed")
-def speed(value:float):
-    if value<0 or value>365: raise HTTPException(400,"Velocidad fuera de rango")
-    with ENGINE_LOCK, db(write=True) as c: c.execute("UPDATE world_state SET speed=?,last_real=? WHERE id=1",(value,time.time(),)); return get_world(c)
-
-@app.post("/api/divine/intervene")
-def intervene(req:DivineAction):
-    with ENGINE_LOCK, db(write=True) as c:
-        consequence=execute_divine_locked(c,req.action,req.target_type,req.target_id,req.parameters,req.description)
-        return {"ok":True,"consequence":consequence,"world":get_world(c)}
-
-@app.post("/api/divine/schedule")
-def schedule(req:ScheduleRequest):
-    with ENGINE_LOCK, db(write=True) as c:
-        w=c.execute("SELECT year,day FROM world_state WHERE id=1").fetchone(); y,d=advance_date(w["year"],w["day"],req.execute_in_days); c.execute("INSERT INTO divine_schedules(execute_year,execute_day,action,target_type,target_id,parameters,description) VALUES(?,?,?,?,?,?,?)",(y,d,req.action,req.target_type,req.target_id,json.dumps(req.parameters,ensure_ascii=False),req.description)); return {"ok":True,"execute_year":y,"execute_day":d}
-
-@app.get("/api/divine/history")
-def divine_history():
-    with db() as c: return {"interventions":[dict(r) for r in c.execute("SELECT * FROM divine_interventions ORDER BY id DESC LIMIT 50")],"schedules":[dict(r) for r in c.execute("SELECT * FROM divine_schedules WHERE active=1 ORDER BY execute_year,execute_day")],"letters":[dict(r) for r in c.execute("SELECT * FROM divine_letters ORDER BY id DESC LIMIT 30")]}
-
-@app.get("/api/chronicles")
-def chronicles(limit:int=30):
-    with db() as c: return [dict(r) for r in c.execute("SELECT * FROM chronicles ORDER BY id DESC LIMIT ?",(min(limit,100),))]
-
-@app.get("/api/stats")
+ catchup()
+ with db() as c:
+  w=dict(world(c)); w['population']=q(c,'SELECT COUNT(*) n FROM people WHERE alive=1').fetchone()['n']; return w
+@app.get('/api/stats')
 def stats():
-    catch_up()
-    with db() as c:
-        return {"people":c.execute("SELECT COUNT(*) n FROM people").fetchone()["n"],"families":c.execute("SELECT COUNT(*) n FROM families").fetchone()["n"],"nobles":c.execute("SELECT COUNT(*) n FROM nobles").fetchone()["n"],"properties":c.execute("SELECT COUNT(*) n FROM properties").fetchone()["n"],"resources":c.execute("SELECT COUNT(*) n FROM resources").fetchone()["n"],"routes":c.execute("SELECT COUNT(*) n FROM routes").fetchone()["n"],"businesses":c.execute("SELECT COUNT(*) n FROM businesses").fetchone()["n"]}
+ with db() as c:
+  return {'population':q(c,'SELECT COUNT(*) n FROM people WHERE alive=1').fetchone()['n'],'dead':q(c,'SELECT COUNT(*) n FROM people WHERE alive=0').fetchone()['n'],'families':q(c,'SELECT COUNT(*) n FROM families').fetchone()['n'],'businesses':q(c,'SELECT COUNT(*) n FROM businesses WHERE active=1').fetchone()['n'],'conflicts':q(c,"SELECT COUNT(*) n FROM conflicts WHERE status='active'").fetchone()['n'],'events':q(c,'SELECT COUNT(*) n FROM events').fetchone()['n'],'chronicles':q(c,'SELECT COUNT(*) n FROM chronicles').fetchone()['n']}
+@app.get('/api/people')
+def people(limit:int=50):
+ with db() as c:return [dict(x) for x in q(c,'SELECT * FROM people ORDER BY id LIMIT ?',(max(1,min(limit,500)),)).fetchall()]
+@app.get('/api/cities')
+def cities():
+ with db() as c:return [dict(x) for x in q(c,'SELECT * FROM cities ORDER BY id').fetchall()]
+@app.get('/api/events')
+def events(limit:int=100):
+ with db() as c:return [dict(x) for x in q(c,'SELECT * FROM events ORDER BY id DESC LIMIT ?',(max(1,min(limit,500)),)).fetchall()]
+@app.get('/api/chronicles')
+def chronicles(limit:int=30):
+ with db() as c:return [dict(x) for x in q(c,'SELECT * FROM chronicles ORDER BY id DESC LIMIT ?',(max(1,min(limit,100)),)).fetchall()]
+@app.post('/api/advance')
+def advance(a:Advance):
+ run_days(a.days); return api_world()
+@app.post('/api/pause')
+def pause():
+ with db(True) as c:q(c,'UPDATE world SET paused=1,last_real=? WHERE id=1',(time.time(),)); return {'paused':True}
+@app.post('/api/resume')
+def resume():
+ with db(True) as c:q(c,'UPDATE world SET paused=0,last_real=? WHERE id=1',(time.time(),)); return {'paused':False}
+@app.post('/api/speed')
+def speed(s:Speed):
+ with db(True) as c:q(c,'UPDATE world SET speed=?,last_real=? WHERE id=1',(s.speed,time.time())); return {'speed':s.speed}
 
-HTML = r'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reino Fénix</title><style>
-*{box-sizing:border-box}body{margin:0;background:#0b1018;color:#edf2f7;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}header{padding:20px;border-bottom:1px solid #273244;position:sticky;top:0;background:#0b1018eF;backdrop-filter:blur(12px);z-index:2}h1{margin:0 0 5px;font-size:30px}small,.muted{color:#a8b3c4}.wrap{max-width:1100px;margin:auto;padding:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#151d29;border:1px solid #29374b;border-radius:18px;padding:16px;box-shadow:0 8px 30px #0002}.big{font-size:27px;font-weight:800}.tabs{display:flex;gap:8px;overflow:auto;margin:12px 0}.tab,button{border:1px solid #3a4a62;background:#223047;color:#fff;padding:11px 14px;border-radius:12px;font-weight:700}.tab.active{background:#536b8e}.panel{display:none}.panel.active{display:block}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,select,textarea{width:100%;background:#202c3e;color:#fff;border:1px solid #3c4d66;border-radius:12px;padding:12px;font-size:15px}label{display:block;color:#aeb9c9;margin:8px 0 5px}.field{flex:1;min-width:180px}.danger{background:#51252a}.ok{background:#254d39}.log{white-space:pre-wrap;line-height:1.6}.pill{display:inline-block;padding:4px 8px;border-radius:99px;background:#263750;margin:3px}.error{color:#ff8f8f}.success{color:#8ff0b5}</style></head><body><header><div class="wrap"><h1>🔥 Reino Fénix</h1><small>Universo autónomo · simulación persistente · Modo Dios</small><div id="status" class="muted">Conectando...</div></div></header><main class="wrap"><div class="tabs"><button class="tab active" onclick="show('home',this)">🌍 Mundo</button><button class="tab" onclick="show('people',this)">👥 Personas</button><button class="tab" onclick="show('economy',this)">💰 Economía</button><button class="tab" onclick="show('politics',this)">👑 Política</button><button class="tab" onclick="show('god',this)">👁️ Dios</button><button class="tab" onclick="show('history',this)">📜 Historia</button></div>
-<section id="home" class="panel active"><div class="grid" id="stats"></div><div class="card"><h2>Crónica del día</h2><div id="chronicle" class="log">Cargando...</div></div><div class="card"><h2>Control del tiempo</h2><div class="row"><button onclick="advance(1)">+1 día</button><button onclick="advance(7)">+1 semana</button><button onclick="advance(30)">+30 días</button><button onclick="advance(365)">+1 año</button><button onclick="togglePause()">Pausa / Reanudar</button></div><p id="msg" class="muted"></p></div></section>
-<section id="people" class="panel"><div class="card"><h2>Habitantes</h2><input id="search" placeholder="Buscar persona..." oninput="loadPeople()"><div id="peopleList"></div></div></section>
-<section id="economy" class="panel"><div class="card"><h2>Economía</h2><div id="econ"></div></div></section>
-<section id="politics" class="panel"><div class="card"><h2>Reinos y poder</h2><div id="pol"></div></div></section>
-<section id="god" class="panel"><div class="card"><h2>👁️ Modo Dios</h2><p class="muted">Los habitantes no conocen tu existencia. Tus intervenciones se registran y sus consecuencias entran en la causalidad del mundo.</p><div class="grid"><div class="field"><label>Acción</label><select id="action" onchange="renderGod()"><option value="wealth">💰 Dar riqueza</option><option value="kill">☠️ Matar</option><option value="save">✨ Salvar</option><option value="health">❤️ Cambiar salud</option><option value="relation">🤝 Cambiar relación</option><option value="reveal">🧠 Revelar información</option><option value="erase">🕳️ Borrar información</option><option value="letter">✉️ Enviar carta</option><option value="weather">🌦️ Cambiar clima</option><option value="resource">⛏️ Crear recursos</option><option value="conflict">⚔️ Crear conflicto</option></select></div></div><div id="godFields"></div><button onclick="godAction()">⚡ Ejecutar intervención</button><div id="godMsg"></div></div></section>
-<section id="history" class="panel"><div class="card"><h2>Historia registrada</h2><div id="hist"></div></div></section></main><script>
-let W=null, people=[]; const $=id=>document.getElementById(id); async function api(u,o={}){let r=await fetch(u,{headers:{'Content-Type':'application/json'},...o});let t=await r.text();if(!r.ok)throw new Error(t);return t?JSON.parse(t):{}}
-function show(id,b){document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));$(id).classList.add('active');document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');if(id==='people')loadPeople();if(id==='economy')loadEconomy();if(id==='politics')loadPolitics();if(id==='god'){loadPeople();renderGod()}if(id==='history')loadHistory()}
-async function load(){try{W=await api('/api/world');render();$('status').textContent='● Motor conectado';$('status').className='success'}catch(e){$('status').textContent='⚠️ '+e.message;$('status').className='error'}}
-function render(){let w=W; $('stats').innerHTML=`<div class=card><div class=muted>Tiempo</div><div class=big>Año ${w.year}</div><div>Día ${w.day}</div></div><div class=card><div class=muted>Población</div><div class=big>${w.population.toLocaleString()}</div></div><div class=card><div class=muted>Riqueza media</div><div class=big>${Math.round(w.avg_wealth)} 🪙</div></div><div class=card><div class=muted>Conflictos activos</div><div class=big>${w.conflicts.length}</div></div>`;$('chronicle').textContent=w.chronicle||'Sin crónica';$('msg').textContent=w.paused?'⏸️ Simulación pausada':'▶️ Simulación activa'}
-async function advance(d){try{W=await api('/api/advance',{method:'POST',body:JSON.stringify({days:d})});render();$('msg').textContent='Avance completado: '+d+' día(s).'}catch(e){$('msg').textContent='❌ '+e.message}}
-async function togglePause(){try{W=W.paused?await api('/api/resume',{method:'POST'}):await api('/api/pause',{method:'POST'});render()}catch(e){$('msg').textContent='❌ '+e.message}}
-async function loadPeople(){try{people=await api('/api/people?q='+encodeURIComponent($('search')?.value||'')+'&limit=150');let s=people.map(p=>`<div class="card"><b>${p.name}</b> · ${p.age} años ${p.alive?'🟢':'⚫'}<br><span class=pill>${p.role}</span><span class=pill>${p.trait}</span><span class=pill>💰 ${p.wealth}</span><span class=pill>❤️ ${Math.round(p.health)}</span><br><small>ID ${p.id}</small></div>`).join('');$('peopleList').innerHTML=s}catch(e){$('peopleList').textContent=e.message}}
-function personOptions(){return people.map(p=>`<option value="${p.id}">${p.name} · ID ${p.id}${p.alive?'':' · muerto'}</option>`).join('')}
-function renderGod(){let a=$('action').value, f=''; if(['wealth','kill','save','health','reveal','erase','letter'].includes(a))f+=`<label>Persona</label><select id="gperson">${personOptions()}</select>`; if(a==='wealth')f+=`<label>Cantidad de oro</label><input id="amount" type=number min=1 value=200>`;if(a==='health')f+=`<label>Salud (0–100)</label><input id="health" type=number min=0 max=100 value=100>`;if(['reveal','erase'].includes(a))f+=`<label>Información</label><textarea id="fact" placeholder="Ej.: Su hermano está endeudado con el mercader del puerto."></textarea>`;if(a==='letter')f+=`<div class=grid><div><label>Remitente aparente</label><input id="sender" value="Una voz desconocida"></div><div><label>Mensaje</label><textarea id="body"></textarea></div></div>`;if(a==='relation')f+=`<div class=grid><div><label>Persona A</label><select id="a">${personOptions()}</select></div><div><label>Persona B</label><select id="b">${personOptions()}</select></div></div><label>Tipo de relación</label><input id="kind" value="amistad"><label>Fuerza (-100 a 100)</label><input id="strength" type=number min=-100 max=100 value=50>`;if(a==='weather')f+=`<label>Ciudad (0 = todas)</label><select id="city"><option value=0>Todas</option>${(W?.cities||[]).map(c=>`<option value=${c.id}>${c.name}</option>`).join('')}</select><label>Clima</label><select id="weather"><option>lluvia</option><option>sequía</option><option>tormenta</option><option>nieve</option><option>calor extremo</option><option>niebla</option></select><label>Intensidad</label><input id="intensity" type=number min=1 max=100 value=60><label>Duración en días</label><input id="duration" type=number min=1 value=3>`;if(a==='resource')f+=`<label>Ciudad</label><select id="city">${(W?.cities||[]).map(c=>`<option value=${c.id}>${c.name}</option>`).join('')}</select><label>Recurso</label><select id="resource">${['grano','madera','hierro','carbón','piedra','lana','ganado','pescado','sal','vino','herramientas'].map(x=>`<option>${x}</option>`).join('')}</select><label>Cantidad</label><input id="quantity" type=number min=1 value=100>`;if(a==='conflict')f+=`<div class=grid><div><label>Nombre</label><input id="name" value="Nueva disputa"></div><div><label>Intensidad</label><input id="intensity" type=number min=1 max=100 value=50></div></div><label>Lado A</label><input id="sidea" value="Facción A"><label>Lado B</label><input id="sideb" value="Facción B"><label>Causa</label><textarea id="cause">Una disputa que los habitantes intentarán explicar según la información que posean.</textarea>`;$('godFields').innerHTML=f}
-async function godAction(){let a=$('action').value,p={};let target_type='world',target_id=0;if(['wealth','kill','save','health','reveal','erase','letter'].includes(a)){target_type='person';target_id=+$('gperson').value}if(a==='wealth')p={amount:+$('amount').value};if(a==='health')p={health:+$('health').value};if(a==='reveal'||a==='erase')p={fact:$('fact').value};if(a==='letter')p={sender:$('sender').value,body:$('body').value};if(a==='relation')p={person_a:+$('a').value,person_b:+$('b').value,kind:$('kind').value,strength:+$('strength').value};if(a==='weather')p={city_id:+$('city').value,weather:$('weather').value,intensity:+$('intensity').value,duration:+$('duration').value};if(a==='resource')p={city_id:+$('city').value,resource:$('resource').value,quantity:+$('quantity').value};if(a==='conflict')p={name:$('name').value,side_a:$('sidea').value,side_b:$('sideb').value,intensity:+$('intensity').value,cause:$('cause').value};try{let r=await api('/api/divine/intervene',{method:'POST',body:JSON.stringify({action:a,target_type,target_id,parameters:p,description:'Intervención manual desde Modo Dios'})});W=r.world;render();$('godMsg').innerHTML='<p class=success>✅ '+r.consequence+'</p>'}catch(e){$('godMsg').innerHTML='<p class=error>❌ '+e.message+'</p>'}}
-async function loadEconomy(){let l=await api('/api/layers');$('econ').innerHTML=`<p><b>${l.businesses.length}</b> negocios activos · <b>${l.resources.length}</b> mercados de recursos · <b>${l.routes.length}</b> rutas</p>`+l.resources.slice(0,24).map(r=>`<span class=pill>${r.resource}: ${r.quantity} · ${r.price.toFixed(1)} 🪙</span>`).join('')}
-async function loadPolitics(){let l=await api('/api/layers');$('pol').innerHTML=l.factions.map(f=>`<span class=pill>${f.name} · influencia ${f.influence}</span>`).join('')+`<p>40 nobles · ${l.offices.length} cargos · ${l.families} familias · ${l.properties} propiedades</p>`}
-async function loadHistory(){let h=await api('/api/chronicles?limit=20');$('hist').innerHTML=h.map(x=>`<div class=card><b>Año ${x.year}, día ${x.day}</b><div class=log>${x.text}</div></div>`).join('')}
-load();setInterval(load,30000);
-</script></body></html>'''
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("server:app",host="127.0.0.1",port=8000,reload=False)
+def divine_locked(c,dv,y,d):
+ p=dv.parameters; action=dv.action; tid=dv.target_id
+ if action in ('wealth','kill','save','health','relation','reveal','erase','letter'):
+  person=q(c,'SELECT * FROM people WHERE id=?',(tid,)).fetchone()
+  if not person:raise HTTPException(404,'Persona no encontrada')
+ if action=='wealth':
+  amount=int(p.get('amount',0)); q(c,'UPDATE people SET wealth=MAX(0,wealth+?) WHERE id=?',(amount,tid)); cons=f'La riqueza de {person["name"]} cambia en {amount}.'
+ elif action=='kill':q(c,"UPDATE people SET alive=0,status='fallecido' WHERE id=?",(tid,)); cons=f'{person["name"]} muere por intervención divina.'
+ elif action=='save':q(c,"UPDATE people SET alive=1,status='ciudadano',health=MAX(health,70) WHERE id=?",(tid,)); cons=f'{person["name"]} vuelve a estar con vida.'
+ elif action=='health':
+  val=float(p.get('value',80)); q(c,'UPDATE people SET health=MAX(0,MIN(100,?)) WHERE id=?',(val,tid)); cons=f'La salud de {person["name"]} pasa a {val:.0f}.'
+ elif action=='relation':
+  other=int(p.get('other_id',0)); strength=float(p.get('strength',70)); q(c,'INSERT OR REPLACE INTO relationships(a,b,kind,strength,trust,resentment) VALUES(?,?,?,?,?,?)',(tid,other,'relacion',strength,strength,0)); q(c,'INSERT OR REPLACE INTO relationships(a,b,kind,strength,trust,resentment) VALUES(?,?,?,?,?,?)',(other,tid,'relacion',strength,strength,0)); cons='Una relación cambia entre dos personas.'
+ elif action=='reveal':
+  fact=str(p.get('fact','')); truth=int(bool(p.get('truth',1))); q(c,'INSERT OR REPLACE INTO knowledge VALUES(?,?,?,?,?,?,?)',(tid,fact,truth,None,y,d,float(p.get('confidence',1)))); cons=f'{person["name"]} recibe conocimiento nuevo.'
+ elif action=='erase':
+  fact=str(p.get('fact','')); q(c,'DELETE FROM knowledge WHERE person_id=? AND fact=?',(tid,fact)); cons=f'El conocimiento indicado desaparece de la memoria informativa de {person["name"]}.'
+ elif action=='letter':q(c,'INSERT INTO letters(year,day,recipient_id,body) VALUES(?,?,?,?)',(y,d,tid,str(p.get('body','')))); cons=f'Una carta llega a {person["name"]}.'
+ elif action=='resource':
+  city=int(p.get('city_id',tid)); res=str(p.get('resource','grano')); amount=int(p.get('amount',0)); q(c,'UPDATE resources SET quantity=MIN(capacity,quantity+?) WHERE city_id=? AND resource=?',(amount,city,res)); cons=f'La disponibilidad de {res} cambia en {city}.'
+ elif action=='conflict':
+  name=str(p.get('name','Conflicto divino')); ka=int(p.get('kingdom_a',1)); kb=int(p.get('kingdom_b',2)); city=int(p.get('city_id',1)); q(c,'INSERT INTO conflicts(name,kingdom_a,kingdom_b,city_id,intensity,cause,status,started_year,started_day) VALUES(?,?,?,?,?,?,?,?,?)',(name,ka,kb,city,float(p.get('intensity',50)),dv.description,'active',y,d)); cons=f'Surge el conflicto {name}.'
+ elif action=='weather':
+  city=int(p.get('city_id',tid)); dur=max(1,int(p.get('duration',3))); ey,ed=y,d+dur
+  while ed>360:ey+=1;ed-=360
+  q(c,'INSERT INTO weather(city_id,year,day,end_year,end_day,kind,intensity) VALUES(?,?,?,?,?,?,?)',(city,y,d,ey,ed,str(p.get('weather','tormenta')),float(p.get('intensity',50)))); cons='El clima de una ciudad cambia por intervención divina.'
+ else:raise HTTPException(400,'Acción divina desconocida')
+ q(c,'INSERT INTO interventions VALUES(NULL,?,?,?,?,?,?,?,?)',(y,d,action,dv.target_type,tid,json.dumps(p,ensure_ascii=False),dv.description,cons)); ev(c,y,d,6,'divino',100,dv.description,cons,'intervención divina','el mundo debe responder a esta nueva condición'); return cons
+@app.post('/api/divine/intervene')
+def intervene(dv:Divine):
+ with db(True) as c:w=world(c); return {'ok':True,'consequence':divine_locked(c,dv,w['year'],w['day'])}
+@app.post('/api/divine/schedule')
+def schedule(s:Schedule):
+ with db(True) as c:q(c,'INSERT INTO schedules(execute_year,execute_day,action,target_type,target_id,parameters,description) VALUES(?,?,?,?,?,?,?)',(s.execute_year,s.execute_day,s.action,s.target_type,s.target_id,json.dumps(s.parameters,ensure_ascii=False),s.description)); return {'ok':True}
+@app.get('/api/divine/history')
+def divine_history(limit:int=100):
+ with db() as c:return [dict(x) for x in q(c,'SELECT * FROM interventions ORDER BY id DESC LIMIT ?',(max(1,min(limit,500)),)).fetchall()]
+@app.get('/',response_class=HTMLResponse)
+def home():
+ return '''<!doctype html><html lang="es"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reino Fénix</title><style>body{font-family:system-ui;background:#111;color:#eee;margin:0}main{max-width:1000px;margin:auto;padding:18px}button,input,select,textarea{padding:10px;margin:4px;border-radius:8px;border:1px solid #555;background:#222;color:#eee}button{cursor:pointer}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}.card{background:#1b1b1b;padding:14px;border-radius:12px}.chron{line-height:1.55;border-left:3px solid #777;padding-left:12px;margin:12px 0}.tabs button{font-weight:700}</style><main><h1>🐦‍🔥 Reino Fénix</h1><p>Simulación autónoma persistente · Observador/Dios</p><div class="tabs"><button onclick="load()">Actualizar</button><button onclick="advance()">Avanzar 1 día</button><button onclick="advance(30)">Avanzar 30 días</button></div><div id="stats" class="grid"></div><h2>Crónicas</h2><div id="chron"></div><h2>Eventos recientes</h2><div id="events"></div><script>async function j(u,o){let r=await fetch(u,o);return r.json()}async function load(){let [s,c,e,w]=await Promise.all([j('/api/stats'),j('/api/chronicles?limit=8'),j('/api/events?limit=12'),j('/api/world')]);document.getElementById('stats').innerHTML=Object.entries({...s,año:w.year,día:w.day,tesoro:w.treasury,inflación:(w.inflation*100).toFixed(2)+'%'}).map(([k,v])=>`<div class=card><b>${k}</b><div>${v}</div></div>`).join('');document.getElementById('chron').innerHTML=c.map(x=>`<div class=chron><b>Año ${x.year}, día ${x.day}</b><br>${x.text}</div>`).join('');document.getElementById('events').innerHTML=e.map(x=>`<div class=card><b>${x.title}</b><br>${x.description}</div>`).join('')}async function advance(n=1){await j('/api/advance',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({days:n})});load()}load()</script></main></html>'''

@@ -1,21 +1,21 @@
-import os,tempfile,subprocess,sys,time,requests
-p=tempfile.NamedTemporaryFile(suffix='.db',delete=False); p.close()
-env=os.environ.copy(); env['FENIX_DB']=p.name
-proc=subprocess.Popen([sys.executable,'-m','uvicorn','server:app','--host','127.0.0.1','--port','8811'],cwd=os.path.dirname(__file__),env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-try:
- for _ in range(50):
-  try:
-   if requests.get('http://127.0.0.1:8811/health',timeout=1).ok:break
-  except: time.sleep(.1)
- assert requests.get('http://127.0.0.1:8811/api/stats').json()['population']==2000
- assert requests.get('http://127.0.0.1:8811/api/stats').json()['families']==179
- requests.post('http://127.0.0.1:8811/api/advance',json={'days':30}).raise_for_status()
- s=requests.get('http://127.0.0.1:8811/api/stats').json(); assert s['population']>=2000 and s['events']>1
- pid=requests.get('http://127.0.0.1:8811/api/people?limit=1').json()[0]['id']
- requests.post('http://127.0.0.1:8811/api/divine/intervene',json={'action':'wealth','target_type':'person','target_id':pid,'parameters':{'amount':5000}}).raise_for_status()
- requests.post('http://127.0.0.1:8811/api/divine/intervene',json={'action':'relation','target_id':pid,'parameters':{'other_id':pid+1,'strength':90}}).raise_for_status()
- requests.post('http://127.0.0.1:8811/api/divine/schedule',json={'execute_year':1,'execute_day':35,'action':'health','target_id':pid,'parameters':{'value':99}}).raise_for_status()
- print('WORLD TEST PASSED')
-finally:
- proc.terminate(); proc.wait(timeout=5)
- os.unlink(p.name)
+import os, tempfile, importlib.util
+from fastapi.testclient import TestClient
+fd, path = tempfile.mkstemp(suffix='.db'); os.close(fd); os.unlink(path)
+os.environ['FENIX_DB'] = path
+spec = importlib.util.spec_from_file_location('server', os.path.join(os.path.dirname(__file__), 'server.py'))
+server = importlib.util.module_from_spec(spec); spec.loader.exec_module(server)
+with TestClient(server.app) as c:
+    s=c.get('/api/stats').json()
+    assert (s['population'],s['families'],s['businesses'],s['nobles'])==(2000,179,24,40)
+    c.post('/api/advance',json={'days':90}).raise_for_status()
+    s=c.get('/api/stats').json(); assert s['chronicles']==90 and s['year']==1 and s['day']==91
+    c.post('/api/divine/intervene',json={'action':'wealth','target_type':'person','target_id':1,'parameters':{'amount':1000},'description':'test'}).raise_for_status()
+    assert c.get('/api/people/1').json()['wealth']>1000
+    c.post('/api/advance',json={'days':275}).raise_for_status()
+    s=c.get('/api/stats').json(); assert s['year']==2 and s['day']==1 and s['chronicles']==365
+    assert c.get('/api/markets').status_code==200
+    assert c.get('/api/crimes').status_code==200
+    assert c.get('/api/armies').status_code==200
+    assert c.get('/api/divine/history').json()
+print('MASTER TEST PASSED')
+os.remove(path)
